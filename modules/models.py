@@ -5,7 +5,8 @@ from __future__ import annotations
 from typing import Any
 
 from sklearn.decomposition import PCA
-from sklearn.ensemble import RandomForestRegressor
+from sklearn.ensemble import AdaBoostRegressor, GradientBoostingRegressor, RandomForestRegressor
+from sklearn.tree import DecisionTreeRegressor
 from sklearn.linear_model import LinearRegression
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import MinMaxScaler, RobustScaler, StandardScaler
@@ -27,7 +28,17 @@ MODEL_NAMES = [
     "PLS / Partial Least Squares",
     "SVR / Support Vector Regression",
     "RF / Random Forest",
+    "AdaBoost / Adaptive Boosting",
+    "GBR / Gradient Boosting",
 ]
+
+
+def _tree_max_depth(value: Any):
+    return None if value in {None, 0, "0", "None"} else int(value)
+
+
+def _max_features(value: Any):
+    return None if value in {None, "None"} else value
 
 
 def make_scaler(name: str):
@@ -52,15 +63,40 @@ def build_regressor(model_name: str, params: dict[str, Any]):
             degree=int(params.get("degree", 3)),
         )
     if model_name == "RF / Random Forest":
-        max_depth = params.get("max_depth")
         return RandomForestRegressor(
             n_estimators=int(params.get("n_estimators", 300)),
-            max_depth=None if max_depth in {None, 0, "None"} else int(max_depth),
+            max_depth=_tree_max_depth(params.get("max_depth")),
             min_samples_split=int(params.get("min_samples_split", 2)),
             min_samples_leaf=int(params.get("min_samples_leaf", 1)),
-            max_features=params.get("max_features", "sqrt"),
+            max_features=_max_features(params.get("max_features", "sqrt")),
             random_state=int(params.get("random_state", 42)),
             n_jobs=-1,
+        )
+    if model_name == "AdaBoost / Adaptive Boosting":
+        base_tree = DecisionTreeRegressor(
+            max_depth=_tree_max_depth(params.get("max_depth", 2)),
+            min_samples_split=int(params.get("min_samples_split", 2)),
+            min_samples_leaf=int(params.get("min_samples_leaf", 1)),
+            random_state=int(params.get("random_state", 42)),
+        )
+        return AdaBoostRegressor(
+            estimator=base_tree,
+            n_estimators=int(params.get("n_estimators", 200)),
+            learning_rate=float(params.get("learning_rate", 0.05)),
+            loss=params.get("loss", "linear"),
+            random_state=int(params.get("random_state", 42)),
+        )
+    if model_name == "GBR / Gradient Boosting":
+        return GradientBoostingRegressor(
+            n_estimators=int(params.get("n_estimators", 300)),
+            learning_rate=float(params.get("learning_rate", 0.05)),
+            max_depth=int(params.get("max_depth", 3)),
+            min_samples_split=int(params.get("min_samples_split", 2)),
+            min_samples_leaf=int(params.get("min_samples_leaf", 1)),
+            subsample=float(params.get("subsample", 1.0)),
+            loss=params.get("loss", "squared_error"),
+            max_features=_max_features(params.get("max_features", None)),
+            random_state=int(params.get("random_state", 42)),
         )
     raise ValueError(f"Unsupported model: {model_name}")
 

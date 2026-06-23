@@ -203,15 +203,15 @@ def pca_explained_variance_plot(estimator):
     return fig
 
 
-def rf_importance_plot(estimator, descriptors: list[str], top_n: int = 20):
+def rf_importance_plot(estimator, descriptors: list[str], top_n: int = 20, title: str = "Descriptor importance"):
     fig, ax = plt.subplots(figsize=(6.5, 4.8))
     regressor = estimator.named_steps.get("regressor")
     if not hasattr(regressor, "feature_importances_"):
-        ax.text(0.5, 0.5, "Feature importance is available for Random Forest models.", ha="center", va="center")
+        ax.text(0.5, 0.5, "Feature importance is available for tree ensemble models.", ha="center", va="center")
         return fig
     importances = pd.Series(regressor.feature_importances_, index=descriptors).sort_values(ascending=False).head(top_n)
     ax.barh(importances.index[::-1], importances.values[::-1], color="#59a14f")
-    ax.set_title("Random Forest descriptor importance")
+    ax.set_title(title)
     ax.set_xlabel("Importance")
     fig.tight_layout()
     return fig

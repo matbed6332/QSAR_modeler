@@ -10,6 +10,14 @@ import pandas as pd
 from modules.plots import fig_to_bytes
 
 
+def safe_file_stem(value: object, fallback: str = "qsar_model") -> str:
+    """Return a filesystem-friendly stem for exported files."""
+
+    stem = "".join(char if char.isalnum() or char in {"-", "_", "."} else "_" for char in str(value))
+    stem = "_".join(part for part in stem.split("_") if part).strip("._-")
+    return stem or fallback
+
+
 def dataframe_to_csv_bytes(df: pd.DataFrame) -> bytes:
     return df.to_csv(index=False).encode("utf-8")
 
@@ -28,7 +36,7 @@ def figures_to_zip_bytes(figures: dict[str, object], fmt: str = "png") -> bytes:
     output = BytesIO()
     with ZipFile(output, mode="w", compression=ZIP_DEFLATED) as archive:
         for name, fig in figures.items():
-            safe_name = name.lower().replace(" ", "_").replace("/", "_")
+            safe_name = safe_file_stem(str(name).lower())
             archive.writestr(f"{safe_name}.{fmt}", fig_to_bytes(fig, fmt=fmt))
     output.seek(0)
     return output.getvalue()

@@ -7,7 +7,6 @@ from io import BytesIO
 from typing import Any
 
 import joblib
-import numpy as np
 import pandas as pd
 
 from modules.applicability_domain import distance_domain_results

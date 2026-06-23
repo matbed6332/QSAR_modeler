@@ -15,12 +15,12 @@ A Streamlit application for building, validating, saving, loading, and visualizi
 - Random split with optional binned-y stratification
 - Sorted endpoint split that keeps minimum and maximum endpoint samples in training
 - Scaling options: none, `StandardScaler`, `MinMaxScaler`, `RobustScaler`
-- Regression models: MLR, PCR, PLS, SVR, Random Forest
+- Regression models: MLR, PCR, PLS, SVR, Random Forest, AdaBoost, Gradient Boosting
 - Feature selection: none, manual, variance threshold, SelectKBest, RFE, and a built-in genetic algorithm
-- Cross-validation, train/test validation metrics, ranked model table, and diagnostic warnings
-- Single-split GA candidate model search with different descriptor subsets, progress feedback, and configurable top-N retention
+- Cross-validation, repeated CV, train/test validation metrics, ranked model table, and diagnostic warnings
+- Single-split GA candidate model search with cached subset scoring, early stopping, progress feedback, and configurable top-N retention
 - Plots: endpoint histogram, interactive observed vs predicted with sample ID hover, residuals, CV scores, interactive Williams plot with sample ID hover, distance-based AD, PCA AD, PCR variance, RF importance, GA progress
-- Export of reports, predictions, selected descriptors, plots, and complete joblib model bundles
+- Export of reports, predictions, selected and removed descriptors, plots, and complete joblib model bundles
 - Exported reports include samples excluded during PCA/outlier review
 - Load saved models and predict new compound descriptor workbooks with applicability-domain assessment
 
@@ -38,9 +38,11 @@ modules/
   models.py
   plots.py
   pca_screening.py
+  chemistry.py
   preprocessing.py
   splitting.py
 requirements.txt
+requirements-rdkit.txt
 tests/
   smoke_test.py
 ```
@@ -93,7 +95,7 @@ If compounds have IDs, place them in the first column of both sheets and enable 
 
 ## Scientific Notes
 
-Preprocessing that depends on descriptor distributions is fitted only on `X_train` and then applied to `X_test` and future prediction data. Scaling is part of the sklearn model pipeline, so cross-validation refits the scaler inside each fold. The test set remains external to model fitting and descriptor-selection fitting.
+Preprocessing that depends on descriptor distributions is fitted only on `X_train` and then applied to `X_test` and future prediction data. Scaling is part of the sklearn model pipeline, so cross-validation refits the scaler inside each fold. The test set remains external to model fitting and descriptor-selection fitting. Excel loading and exploratory PCA screening are cached by Streamlit to reduce avoidable recalculation during UI interaction.
 
 The Williams plot uses leverage from the selected descriptor matrix and standardized residual limits of `+/- 3`. The distance-based applicability-domain plot is an Insubria-style proxy based on distance to the training-set centroid in standardized descriptor space.
 

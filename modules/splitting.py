@@ -39,6 +39,18 @@ def random_split(
 ) -> SplitResult:
     """Random train/test split with optional binned-y stratification."""
 
+    if len(X) != len(y):
+        raise ValueError("X and y must contain the same number of aligned samples before splitting.")
+    if len(y) < 4:
+        raise ValueError("At least 4 samples are required to create an external train/test split.")
+    test_size = float(test_size)
+    if not 0.0 < test_size < 1.0:
+        raise ValueError("Test set fraction must be between 0 and 1.")
+    n_test = int(np.ceil(len(y) * test_size))
+    n_train = len(y) - n_test
+    if n_train < 2 or n_test < 1:
+        raise ValueError("Split fraction leaves too few train or test samples.")
+
     stratify = None
     warnings: list[str] = []
     if stratify_bins and stratify_bins > 1:
@@ -58,11 +70,12 @@ def random_split(
         random_state=random_state,
         stratify=stratify,
     )
+    train_index = set(X_train.index)
     membership = pd.DataFrame(
         {
             "sample_id": X.index.astype(str),
             "endpoint": y.values,
-            "split": ["train" if idx in X_train.index else "test" for idx in X.index],
+            "split": np.where(X.index.isin(train_index), "train", "test"),
         },
         index=X.index,
     )
@@ -79,8 +92,13 @@ def sorted_endpoint_split(
 ) -> SplitResult:
     """Split sorted by endpoint and force the min/max endpoint samples into training."""
 
+    if len(X) != len(y):
+        raise ValueError("X and y must contain the same number of aligned samples before splitting.")
     if len(y) < 4:
         raise ValueError("Sorted endpoint split requires at least 4 samples.")
+    train_fraction = float(train_fraction)
+    if not 0.0 < train_fraction < 1.0:
+        raise ValueError("Training fraction must be between 0 and 1.")
 
     sorted_index = y.sort_values().index.to_list()
     n_samples = len(sorted_index)
@@ -128,13 +146,14 @@ def sorted_endpoint_split(
 
 
 def split_range_table(y_train: pd.Series, y_test: pd.Series) -> pd.DataFrame:
-    return pd.DataFrame(
-        {
-            "Set": ["Train", "Test"],
-            "Samples": [len(y_train), len(y_test)],
-            "Endpoint min": [y_train.min(), y_test.min()],
-            "Endpoint max": [y_train.max(), y_test.max()],
-            "Endpoint mean": [y_train.mean(), y_test.mean()],
+    def summary_row(label: str, values: pd.Series) -> dict[str, float | int | str]:
+        return {
+            "Set": label,
+            "Samples": int(len(values)),
+            "Endpoint min": float(values.min()) if len(values) else np.nan,
+            "Endpoint max": float(values.max()) if len(values) else np.nan,
+            "Endpoint mean": float(values.mean()) if len(values) else np.nan,
         }
-    )
+
+    return pd.DataFrame([summary_row("Train", y_train), summary_row("Test", y_test)])
 

@@ -88,7 +88,34 @@ def main() -> None:
 
     estimator = build_pipeline("MLR / Linear Regression", {"fit_intercept": True}, "StandardScaler")
     estimator.fit(X_train_selected, split.y_train)
-    evaluation = evaluate_fitted_model(estimator, X_train_selected, split.y_train, X_test_selected, split.y_test, cv_folds=5)
+    evaluation = evaluate_fitted_model(
+        estimator,
+        X_train_selected,
+        split.y_train,
+        X_test_selected,
+        split.y_test,
+        cv_folds=5,
+        cv_repeats=2,
+    )
+    assert evaluation.cv_scores.shape[0] == 10
+
+    ada = build_pipeline(
+        "AdaBoost / Adaptive Boosting",
+        {"n_estimators": 8, "learning_rate": 0.05, "max_depth": 2, "random_state": 42},
+        "None",
+    )
+    ada.fit(X_train_selected, split.y_train)
+    assert ada.predict(X_test_selected).shape[0] == len(split.y_test)
+    assert hasattr(ada.named_steps["regressor"], "feature_importances_")
+
+    gbr = build_pipeline(
+        "GBR / Gradient Boosting",
+        {"n_estimators": 8, "learning_rate": 0.05, "max_depth": 2, "random_state": 42},
+        "None",
+    )
+    gbr.fit(X_train_selected, split.y_train)
+    assert gbr.predict(X_test_selected).shape[0] == len(split.y_test)
+    assert hasattr(gbr.named_steps["regressor"], "feature_importances_")
 
     w_ad = williams_results(X_train_selected, X_test_selected, evaluation.train_predictions, evaluation.test_predictions)
     d_ad = distance_domain_results(X_train_selected, X_test_selected)

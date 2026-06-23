@@ -58,8 +58,14 @@ def run_genetic_algorithm_selection(
     scoring_metric: str = "Q2 / CV R2",
     cv_folds: int = 5,
     random_seed: int = 42,
+    early_stopping_rounds: int = 0,
 ) -> GAResult:
-    """Run a compact GA over descriptor bitmasks using cross-validation fitness."""
+    """Run a compact GA over descriptor bitmasks using cross-validation fitness.
+
+    Fitness values are cached by descriptor bitmask so repeated subsets are
+    not refitted. Optional early stopping ends the search when the best
+    score has not improved for the requested number of generations.
+    """
 
     if X.empty:
         raise ValueError("GA feature selection requires at least one descriptor.")
@@ -71,6 +77,7 @@ def run_genetic_algorithm_selection(
     population_size = max(4, int(population_size))
     tournament_size = max(2, min(int(tournament_size), population_size))
     cv_folds = max(2, min(int(cv_folds), len(y)))
+    early_stopping_rounds = max(0, int(early_stopping_rounds))
     cv = KFold(n_splits=cv_folds, shuffle=True, random_state=random_seed)
     scoring = _scoring_name(scoring_metric)
     cache: dict[tuple[bool, ...], float] = {}
@@ -107,21 +114,33 @@ def run_genetic_algorithm_selection(
         return population[best_idx].copy()
 
     population = [random_mask() for _ in range(population_size)]
-    history_rows: list[dict[str, float]] = []
+    history_rows: list[dict[str, float | int | bool]] = []
+    best_score_seen = -np.inf
+    stale_generations = 0
 
     for generation in range(generations + 1):
         scores = [fitness(mask) for mask in population]
         best_idx = int(np.nanargmax(scores))
+        generation_best = float(scores[best_idx])
         finite_scores = [score for score in scores if np.isfinite(score)]
+        improved = generation_best > best_score_seen + 1e-12
+        if improved:
+            best_score_seen = generation_best
+            stale_generations = 0
+        else:
+            stale_generations += 1
+        early_stop = bool(early_stopping_rounds and stale_generations >= early_stopping_rounds)
         history_rows.append(
             {
                 "generation": generation,
-                "best_score": float(scores[best_idx]),
+                "best_score": generation_best,
                 "mean_score": float(np.mean(finite_scores)) if finite_scores else np.nan,
                 "best_descriptor_count": int(population[best_idx].sum()),
+                "evaluated_subsets": int(len(cache)),
+                "early_stopped": early_stop,
             }
         )
-        if generation == generations:
+        if generation == generations or early_stop:
             break
 
         new_population = [population[best_idx].copy()]
@@ -204,6 +223,7 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
                 scoring_metric=self.params.get("scoring_metric", "Q2 / CV R2"),
                 cv_folds=int(self.params.get("cv_folds", 5)),
                 random_seed=int(self.params.get("random_seed", 42)),
+                early_stopping_rounds=int(self.params.get("early_stopping_rounds", 0)),
             )
             self.selected_descriptors_ = result.selected_descriptors
             self.ga_history_ = result.history

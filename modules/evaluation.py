@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from sklearn.base import clone
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
-from sklearn.model_selection import KFold, RepeatedKFold, cross_val_predict, cross_val_score
+from sklearn.model_selection import KFold, RepeatedKFold
 
 from modules.models import flatten_prediction
 
@@ -29,6 +29,8 @@ def rmse(y_true, y_pred) -> float:
 
 
 def adjusted_cv_folds(n_samples: int, requested_folds: int) -> int:
+    if n_samples < 2:
+        raise ValueError("Cross-validation requires at least 2 training samples.")
     return max(2, min(int(requested_folds), int(n_samples)))
 
 
@@ -37,6 +39,53 @@ def make_cv(n_samples: int, folds: int = 5, repeats: int = 1, random_state: int 
     if repeats > 1:
         return RepeatedKFold(n_splits=folds, n_repeats=int(repeats), random_state=random_state)
     return KFold(n_splits=folds, shuffle=True, random_state=random_state)
+
+
+def _r2_or_nan(y_true, y_pred) -> float:
+    if len(y_true) < 2:
+        return np.nan
+    return float(r2_score(y_true, y_pred))
+
+
+def cross_validated_predictions_and_scores(estimator, X: pd.DataFrame, y: pd.Series, cv) -> tuple[np.ndarray, pd.DataFrame]:
+    """Generate CV predictions and fold metrics with one set of model fits.
+
+    The estimator is cloned and refit inside each training fold, preserving
+    the no-leakage contract for scalers, PCA/PCR steps, and model fitting.
+    Repeated CV produces multiple predictions per sample; those predictions
+    are averaged for the aggregate Q2/RMSE/MAE statistics.
+    """
+
+    X_frame = pd.DataFrame(X)
+    y_series = pd.Series(y, index=X_frame.index).astype(float)
+    pred_sum = np.zeros(len(y_series), dtype=float)
+    pred_count = np.zeros(len(y_series), dtype=int)
+    rows: list[dict[str, float | int]] = []
+
+    for fold, (train_idx, validation_idx) in enumerate(cv.split(X_frame, y_series), start=1):
+        fold_estimator = clone(estimator)
+        X_fold_train = X_frame.iloc[train_idx]
+        y_fold_train = y_series.iloc[train_idx]
+        X_fold_validation = X_frame.iloc[validation_idx]
+        y_fold_validation = y_series.iloc[validation_idx]
+        fold_estimator.fit(X_fold_train, y_fold_train)
+        fold_pred = flatten_prediction(fold_estimator.predict(X_fold_validation))
+        pred_sum[validation_idx] += fold_pred
+        pred_count[validation_idx] += 1
+        rows.append(
+            {
+                "fold": fold,
+                "n_train": int(len(train_idx)),
+                "n_validation": int(len(validation_idx)),
+                "R2": _r2_or_nan(y_fold_validation, fold_pred),
+                "RMSE": rmse(y_fold_validation, fold_pred),
+                "MAE": float(mean_absolute_error(y_fold_validation, fold_pred)),
+            }
+        )
+
+    if (pred_count == 0).any():
+        raise ValueError("Cross-validation did not generate predictions for every training sample.")
+    return pred_sum / pred_count, pd.DataFrame(rows)
 
 
 def regression_line(y_true, y_pred) -> tuple[float, float]:
@@ -78,15 +127,10 @@ def evaluate_fitted_model(
     test_pred = flatten_prediction(estimator.predict(X_test)) if len(X_test) else np.array([])
 
     cv = make_cv(len(y_train), cv_folds, cv_repeats, random_state)
-    cv_estimator = clone(estimator)
-    cv_pred = flatten_prediction(cross_val_predict(cv_estimator, X_train, y_train, cv=cv, n_jobs=None))
-    cv_r2_scores = cross_val_score(clone(estimator), X_train, y_train, cv=cv, scoring="r2", n_jobs=None)
-    cv_rmse_scores = -cross_val_score(
-        clone(estimator), X_train, y_train, cv=cv, scoring="neg_root_mean_squared_error", n_jobs=None
-    )
-    cv_mae_scores = -cross_val_score(
-        clone(estimator), X_train, y_train, cv=cv, scoring="neg_mean_absolute_error", n_jobs=None
-    )
+    cv_pred, cv_scores = cross_validated_predictions_and_scores(estimator, X_train, y_train, cv)
+    cv_r2_scores = cv_scores["R2"].dropna().to_numpy(dtype=float)
+    cv_rmse_scores = cv_scores["RMSE"].dropna().to_numpy(dtype=float)
+    cv_mae_scores = cv_scores["MAE"].dropna().to_numpy(dtype=float)
 
     train_slope, train_intercept = regression_line(y_train, train_pred)
     test_slope, test_intercept = regression_line(y_test, test_pred) if len(y_test) else (np.nan, np.nan)
@@ -97,7 +141,7 @@ def evaluate_fitted_model(
     metrics: dict[str, Any] = {
         "R2 train": float(r2_score(y_train, train_pred)),
         "R2 test": float(r2_score(y_test, test_pred)) if len(y_test) > 1 else np.nan,
-        "Q2 CV": float(r2_score(y_train, cv_pred)),
+        "Q2 CV": float(r2_score(y_train, cv_pred)) if len(y_train) > 1 else np.nan,
         "RMSE train": rmse(y_train, train_pred),
         "RMSE test": rmse(y_test, test_pred) if len(y_test) else np.nan,
         "RMSE CV": rmse(y_train, cv_pred),
@@ -119,17 +163,11 @@ def evaluate_fitted_model(
     }
 
     warnings = diagnostic_warnings(metrics, len(y_train), X_train.shape[1])
+    if cv_scores["R2"].isna().any():
+        warnings.append("Some CV folds had fewer than 2 validation samples, so fold-level R2 is undefined for those folds.")
     train_predictions = prediction_frame(X_train.index, y_train, train_pred, "train")
     test_predictions = prediction_frame(X_test.index, y_test, test_pred, "test")
     cv_predictions = prediction_frame(X_train.index, y_train, cv_pred, "cv")
-    cv_scores = pd.DataFrame(
-        {
-            "fold": np.arange(1, len(cv_r2_scores) + 1),
-            "R2": cv_r2_scores,
-            "RMSE": cv_rmse_scores,
-            "MAE": cv_mae_scores,
-        }
-    )
     return EvaluationResult(metrics, train_predictions, test_predictions, cv_predictions, cv_scores, warnings)
 
 

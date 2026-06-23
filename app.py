@@ -16,7 +16,7 @@ from modules.applicability_domain import distance_domain_results, pca_domain_sco
 from modules.chemistry import rdkit_available, smiles_to_png_bytes
 from modules.data_loader import clean_sheet, dataset_summary, endpoint_transform_preview, prepare_xy, read_excel_sheets
 from modules.evaluation import evaluate_fitted_model, rank_models, results_table
-from modules.export import dataframe_to_csv_bytes, dataframes_to_excel_bytes, figures_to_zip_bytes, list_to_frame
+from modules.export import dataframe_to_csv_bytes, dataframes_to_excel_bytes, figures_to_zip_bytes, list_to_frame, safe_file_stem
 from modules.feature_selection import FeatureSelector
 from modules.model_io import ModelBundle, bundle_from_bytes, bundle_to_bytes, predict_with_bundle
 from modules.models import MODEL_NAMES, build_pipeline, estimator_parameters
@@ -52,6 +52,13 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
+
+FEATURE_IMPORTANCE_MODELS = {
+    "RF / Random Forest",
+    "AdaBoost / Adaptive Boosting",
+    "GBR / Gradient Boosting",
+}
 
 
 st.markdown(
@@ -111,6 +118,16 @@ st.markdown(
 )
 
 
+@st.cache_data(show_spinner="Reading Excel workbook...")
+def cached_read_excel_sheets(data: bytes) -> dict[str, pd.DataFrame]:
+    return read_excel_sheets(BytesIO(data))
+
+
+@st.cache_data(show_spinner=False)
+def cached_pca_screening(X: pd.DataFrame, y: pd.Series, n_components: int, scale: bool):
+    return compute_pca_screening(X, y, n_components=n_components, scale=scale)
+
+
 def init_state() -> None:
     defaults = {
         "sheets": None,
@@ -142,6 +159,8 @@ def metric_panel(label: str, value: Any) -> None:
 
 
 def display_messages(messages: list[str], level: str = "warning") -> None:
+    if not messages:
+        return
     for message in messages:
         if level == "error":
             st.error(message)
@@ -570,11 +589,32 @@ def create_figures_for_result(label: str, payload: dict[str, Any]) -> dict[str, 
         figures["Applicability Domain - PCA plot"] = pca_score_plot(payload["pca_ad"])
     if payload["feature_selector"].method == "Genetic Algorithm" and not payload["feature_selector"].ga_history_.empty:
         figures["GA progress"] = ga_progress_plot(payload["feature_selector"].ga_history_)
-    if payload["model_name"] == "RF / Random Forest":
-        figures["RF importance"] = rf_importance_plot(payload["estimator"], payload["selected_descriptors"])
+    if payload["model_name"] in FEATURE_IMPORTANCE_MODELS:
+        model_short = payload["model_name"].split(" / ")[0]
+        figures[f"{model_short} descriptor importance"] = rf_importance_plot(
+            payload["estimator"],
+            payload["selected_descriptors"],
+            title=f"{model_short} descriptor importance",
+        )
     if payload["model_name"] == "PCR / Principal Component Regression":
         figures["PCR explained variance"] = pca_explained_variance_plot(payload["estimator"])
     return figures
+
+
+def removed_descriptors_frame(preprocessor: DescriptorPreprocessor) -> pd.DataFrame:
+    report = preprocessor.get_report()
+    groups = {
+        "missing_columns": report.dropped_missing_columns,
+        "constant": report.constant_columns,
+        "low_variance": report.low_variance_columns,
+        "high_correlation": report.correlated_columns,
+    }
+    rows = [
+        {"reason": reason, "descriptor": descriptor}
+        for reason, descriptors in groups.items()
+        for descriptor in descriptors
+    ]
+    return pd.DataFrame(rows, columns=["reason", "descriptor"])
 
 
 def build_report_sheets(label: str, payload: dict[str, Any], all_results: pd.DataFrame) -> dict[str, pd.DataFrame]:
@@ -586,6 +626,7 @@ def build_report_sheets(label: str, payload: dict[str, Any], all_results: pd.Dat
     return {
         "Summary": all_results,
         "Preprocessing": payload["preprocessor"].get_report().to_frame(),
+        "Removed descriptors": removed_descriptors_frame(payload["preprocessor"]),
         "Selected descriptors": list_to_frame(payload["selected_descriptors"]),
         "Train predictions": evaluation.train_predictions.reset_index(drop=True),
         "Test predictions": evaluation.test_predictions.reset_index(drop=True),
@@ -682,7 +723,7 @@ def run_training_workflow(
             )
 
             raw_params = dict(model_params.get(model_name, {}))
-            if model_name == "RF / Random Forest":
+            if model_name in FEATURE_IMPORTANCE_MODELS:
                 raw_params["random_state"] = split_seed
             estimator_factory = make_estimator_factory(model_name, raw_params, scaler_name, len(y_train), cv_folds)
 
@@ -846,7 +887,7 @@ with tabs[0]:
     uploaded = st.file_uploader("Excel workbook", type=["xlsx", "xlsm", "xls"])
     if uploaded is not None and uploaded.name != st.session_state.uploaded_name:
         try:
-            st.session_state.sheets = read_excel_sheets(BytesIO(uploaded.getvalue()))
+            st.session_state.sheets = cached_read_excel_sheets(uploaded.getvalue())
             st.session_state.uploaded_name = uploaded.name
             st.session_state.dataset = None
             st.session_state.excluded_sample_ids = []
@@ -856,6 +897,9 @@ with tabs[0]:
         except Exception as exc:
             st.session_state.sheets = None
             st.error(f"Could not read workbook: {exc}")
+
+    if uploaded is None and not st.session_state.sheets:
+        st.info("Upload an Excel workbook to begin. The app will then ask for descriptor, endpoint, and optional SMILES sheets.")
 
     if st.session_state.sheets:
         sheets = st.session_state.sheets
@@ -868,6 +912,9 @@ with tabs[0]:
             y_sheet_name = st.selectbox("Endpoint sheet (y)", sheet_names, key="y_sheet")
             y_clean = clean_sheet(sheets[y_sheet_name], use_first_column_as_index=use_id_column)
             endpoint_columns = [str(col) for col in y_clean.columns]
+            if not endpoint_columns:
+                st.error("The selected endpoint sheet has no usable columns after empty columns were removed.")
+                st.stop()
             endpoint_column = st.selectbox("Endpoint column", endpoint_columns)
 
         smiles_sheet_name = None
@@ -880,11 +927,14 @@ with tabs[0]:
             with smiles_cols[1]:
                 smiles_clean = clean_sheet(sheets[smiles_sheet_name], use_first_column_as_index=use_id_column)
                 smiles_columns = [str(col) for col in smiles_clean.columns]
-                default_smiles_idx = next(
-                    (idx for idx, col in enumerate(smiles_columns) if "smiles" in col.casefold()),
-                    0,
-                )
-                smiles_column = st.selectbox("SMILES column", smiles_columns, index=default_smiles_idx, key="smiles_column")
+                if smiles_columns:
+                    default_smiles_idx = next(
+                        (idx for idx, col in enumerate(smiles_columns) if "smiles" in col.casefold()),
+                        0,
+                    )
+                    smiles_column = st.selectbox("SMILES column", smiles_columns, index=default_smiles_idx, key="smiles_column")
+                else:
+                    st.warning("The selected SMILES sheet has no usable columns.")
 
         preview_cols = st.columns(2)
         with preview_cols[0]:
@@ -914,14 +964,14 @@ with tabs[0]:
                 st.error(str(exc))
 
     if st.session_state.dataset is not None:
+        raw_dataset = st.session_state.dataset
         dataset = active_dataset()
-        curated = active_dataset()
         summary = dataset_summary(dataset.X, dataset.y)
         m1, m2, m3, m4, m5, m6 = st.columns(6)
         with m1:
-            metric_panel("Samples", summary["samples"])
+            metric_panel("Total samples", raw_dataset.X.shape[0])
         with m2:
-            metric_panel("Active samples", curated.X.shape[0])
+            metric_panel("Active samples", dataset.X.shape[0])
         with m3:
             metric_panel("Numeric descriptors", summary["descriptors"])
         with m4:
@@ -968,7 +1018,7 @@ with tabs[1]:
             n_pcs = synced_int_control("PCA components", 2, max(2, max_pcs), min(5, max_pcs), 1, "pca_components")
             scale_pca = st.checkbox("Standardize descriptors before PCA", value=True, key="scale_pca")
             try:
-                pca_result = compute_pca_screening(dataset.X, dataset.y, n_components=n_pcs, scale=scale_pca)
+                pca_result = cached_pca_screening(dataset.X, dataset.y, n_components=n_pcs, scale=scale_pca)
                 if dataset.smiles is not None:
                     pca_result.scores["smiles"] = dataset.smiles.reindex(pca_result.scores.index).astype("string").fillna("")
                 variance = pca_result.variance.copy()
@@ -1252,6 +1302,26 @@ with tabs[4]:
                     params["min_samples_leaf"] = st.slider("Min samples leaf", 1, 20, 1, key=f"{model_name}_min_samples_leaf")
                     params["max_features"] = st.selectbox("Max features", ["sqrt", "log2", None, 1.0], key=f"{model_name}_max_features")
                     params["random_state"] = int(st.session_state.get("random_seed", 42))
+                elif model_name == "AdaBoost / Adaptive Boosting":
+                    st.caption("AdaBoost regression uses shallow decision trees as weak learners. Interpret descriptor influence with feature importance, not linear coefficients.")
+                    params["n_estimators"] = synced_int_control("Estimators", 10, 5000, 200, 10, f"{model_name}_n_estimators")
+                    params["learning_rate"] = st.number_input("Learning rate", min_value=0.001, value=0.05, step=0.01, format="%.3f", key=f"{model_name}_learning_rate")
+                    params["loss"] = st.selectbox("Loss", ["linear", "square", "exponential"], key=f"{model_name}_loss")
+                    params["max_depth"] = st.slider("Weak tree max depth", 1, 20, 2, key=f"{model_name}_max_depth")
+                    params["min_samples_split"] = st.slider("Min samples split", 2, 20, 2, key=f"{model_name}_min_samples_split")
+                    params["min_samples_leaf"] = st.slider("Min samples leaf", 1, 20, 1, key=f"{model_name}_min_samples_leaf")
+                    params["random_state"] = int(st.session_state.get("random_seed", 42))
+                elif model_name == "GBR / Gradient Boosting":
+                    st.caption("Gradient Boosting is often strong for nonlinear QSAR/QSPR patterns, but descriptor effects are ensemble-level rather than coefficient-level.")
+                    params["n_estimators"] = synced_int_control("Estimators", 10, 5000, 300, 10, f"{model_name}_n_estimators")
+                    params["learning_rate"] = st.number_input("Learning rate", min_value=0.001, value=0.05, step=0.01, format="%.3f", key=f"{model_name}_learning_rate")
+                    params["max_depth"] = st.slider("Tree max depth", 1, 20, 3, key=f"{model_name}_max_depth")
+                    params["min_samples_split"] = st.slider("Min samples split", 2, 20, 2, key=f"{model_name}_min_samples_split")
+                    params["min_samples_leaf"] = st.slider("Min samples leaf", 1, 20, 1, key=f"{model_name}_min_samples_leaf")
+                    params["subsample"] = st.slider("Subsample", 0.1, 1.0, 1.0, 0.05, key=f"{model_name}_subsample")
+                    params["loss"] = st.selectbox("Loss", ["squared_error", "absolute_error", "huber"], key=f"{model_name}_loss")
+                    params["max_features"] = st.selectbox("Max features", [None, "sqrt", "log2", 1.0], key=f"{model_name}_max_features")
+                    params["random_state"] = int(st.session_state.get("random_seed", 42))
                 model_params[model_name] = params
 
         st.session_state.model_config = {
@@ -1311,6 +1381,7 @@ with tabs[5]:
                 fs_params["crossover_probability"] = st.slider("Crossover probability", 0.0, 1.0, 0.8, 0.05)
                 fs_params["mutation_probability"] = st.slider("Mutation probability", 0.0, 0.5, 0.05, 0.01)
                 fs_params["tournament_size"] = st.slider("Tournament size", 2, 10, 3)
+                fs_params["early_stopping_rounds"] = synced_int_control("Early stopping generations", 0, 100, 10, 1, "ga_early_stopping_rounds")
             with g3:
                 fs_params["min_descriptors"] = synced_int_control(
                     "Minimum descriptors",
@@ -1555,6 +1626,7 @@ with tabs[8]:
         results = st.session_state.training_results
         selected_label = st.selectbox("Export model", list(results.keys()), key="export_model_label")
         payload = results[selected_label]
+        export_stem = safe_file_stem(selected_label)
         report_sheets = build_report_sheets(selected_label, payload, st.session_state.results_df)
 
         e1, e2, e3 = st.columns(3)
@@ -1562,27 +1634,33 @@ with tabs[8]:
             st.download_button(
                 "Download Excel report",
                 data=dataframes_to_excel_bytes(report_sheets),
-                file_name=f"{selected_label.replace(' ', '_').replace('/', '-')}_report.xlsx",
+                file_name=f"{export_stem}_report.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
             predictions = pd.concat([payload["evaluation"].train_predictions, payload["evaluation"].test_predictions], axis=0)
             st.download_button(
                 "Download predictions CSV",
                 data=dataframe_to_csv_bytes(predictions.reset_index(drop=True)),
-                file_name=f"{selected_label.replace(' ', '_').replace('/', '-')}_predictions.csv",
+                file_name=f"{export_stem}_predictions.csv",
                 mime="text/csv",
             )
         with e2:
             st.download_button(
                 "Download selected descriptors CSV",
                 data=dataframe_to_csv_bytes(list_to_frame(payload["selected_descriptors"])),
-                file_name=f"{selected_label.replace(' ', '_').replace('/', '-')}_selected_descriptors.csv",
+                file_name=f"{export_stem}_selected_descriptors.csv",
+                mime="text/csv",
+            )
+            st.download_button(
+                "Download removed descriptors CSV",
+                data=dataframe_to_csv_bytes(removed_descriptors_frame(payload["preprocessor"])),
+                file_name=f"{export_stem}_removed_descriptors.csv",
                 mime="text/csv",
             )
             st.download_button(
                 "Download model bundle",
                 data=bundle_to_bytes(payload["bundle"]),
-                file_name=f"{selected_label.replace(' ', '_').replace('/', '-')}_model.joblib",
+                file_name=f"{export_stem}_model.joblib",
                 mime="application/octet-stream",
             )
         with e3:
@@ -1590,14 +1668,14 @@ with tabs[8]:
             st.download_button(
                 "Download plots ZIP",
                 data=figures_to_zip_bytes(payload["figures"], fmt=image_format),
-                file_name=f"{selected_label.replace(' ', '_').replace('/', '-')}_plots.zip",
+                file_name=f"{export_stem}_plots.zip",
                 mime="application/zip",
             )
             single_plot = st.selectbox("Single plot", list(payload["figures"].keys()))
             st.download_button(
                 "Download selected plot",
                 data=fig_to_bytes(payload["figures"][single_plot], fmt=image_format),
-                file_name=f"{single_plot.lower().replace(' ', '_')}.{image_format}",
+                file_name=f"{safe_file_stem(single_plot.lower())}.{image_format}",
                 mime=f"image/{'jpeg' if image_format == 'jpg' else 'png'}",
             )
 
@@ -1629,7 +1707,7 @@ with tabs[9]:
         new_data = st.file_uploader("New descriptor workbook", type=["xlsx", "xlsm", "xls"], key="new_data_upload")
         if new_data is not None:
             try:
-                new_sheets = read_excel_sheets(BytesIO(new_data.getvalue()))
+                new_sheets = cached_read_excel_sheets(new_data.getvalue())
                 new_sheet_name = st.selectbox("Descriptor sheet for prediction", list(new_sheets.keys()))
                 use_new_id = st.checkbox("Use first column as sample ID for prediction", value=False, key="new_use_id")
                 X_new = clean_sheet(new_sheets[new_sheet_name], use_first_column_as_index=use_new_id)
