@@ -25,25 +25,40 @@ class ModelBundle:
     metadata: dict[str, Any] = field(default_factory=dict)
     train_reference_X: pd.DataFrame | None = None
     statistics: dict[str, Any] = field(default_factory=dict)
+    result_payload: dict[str, Any] = field(default_factory=dict)
+    results_table: pd.DataFrame = field(default_factory=pd.DataFrame)
+    session_state: dict[str, Any] = field(default_factory=dict)
 
 
-def bundle_to_bytes(bundle: ModelBundle) -> bytes:
+@dataclass
+class ModelRunBundle:
+    """A persisted package containing every kept model from one training run."""
+
+    run_label: str
+    bundles: dict[str, ModelBundle]
+    results_table: pd.DataFrame = field(default_factory=pd.DataFrame)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    training_results: dict[str, dict[str, Any]] = field(default_factory=dict)
+    session_state: dict[str, Any] = field(default_factory=dict)
+
+
+def bundle_to_bytes(bundle: Any) -> bytes:
     buffer = BytesIO()
     joblib.dump(bundle, buffer)
     buffer.seek(0)
     return buffer.getvalue()
 
 
-def bundle_from_bytes(data: bytes) -> ModelBundle:
+def bundle_from_bytes(data: bytes) -> ModelBundle | ModelRunBundle:
     buffer = BytesIO(data)
     return joblib.load(buffer)
 
 
-def save_bundle(bundle: ModelBundle, path: str) -> None:
+def save_bundle(bundle: ModelBundle | ModelRunBundle, path: str) -> None:
     joblib.dump(bundle, path)
 
 
-def load_bundle(path: str) -> ModelBundle:
+def load_bundle(path: str) -> ModelBundle | ModelRunBundle:
     return joblib.load(path)
 
 
@@ -70,4 +85,38 @@ def predict_with_bundle(bundle: ModelBundle, X_new: pd.DataFrame) -> tuple[pd.Da
         ad_table = ad_table[ad_table["split"] == "test"].copy()
         ad_table["sample_id"] = X_selected.index.astype(str)
     return prediction_table, ad_table
+
+
+def predict_with_run_bundle(
+    run_bundle: ModelRunBundle,
+    X_new: pd.DataFrame,
+) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Predict new compounds with every model in a saved run package."""
+
+    prediction_frames: list[pd.DataFrame] = []
+    ad_frames: list[pd.DataFrame] = []
+    error_rows: list[dict[str, str]] = []
+
+    for label, bundle in run_bundle.bundles.items():
+        try:
+            predictions, ad_table = predict_with_bundle(bundle, X_new)
+        except Exception as exc:
+            error_rows.append({"model_label": label, "error": str(exc)})
+            continue
+
+        predictions = predictions.copy()
+        predictions.insert(0, "model_label", label)
+        predictions.insert(1, "model_name", bundle.model_name)
+        prediction_frames.append(predictions)
+
+        if not ad_table.empty:
+            ad_table = ad_table.copy()
+            ad_table.insert(0, "model_label", label)
+            ad_table.insert(1, "model_name", bundle.model_name)
+            ad_frames.append(ad_table)
+
+    prediction_table = pd.concat(prediction_frames, axis=0, ignore_index=True) if prediction_frames else pd.DataFrame()
+    ad_table = pd.concat(ad_frames, axis=0, ignore_index=True) if ad_frames else pd.DataFrame()
+    errors = pd.DataFrame(error_rows)
+    return prediction_table, ad_table, errors
 

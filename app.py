@@ -18,7 +18,7 @@ from modules.data_loader import clean_sheet, dataset_summary, endpoint_transform
 from modules.evaluation import evaluate_fitted_model, rank_models, results_table
 from modules.export import dataframe_to_csv_bytes, dataframes_to_excel_bytes, figures_to_zip_bytes, list_to_frame, safe_file_stem
 from modules.feature_selection import FeatureSelector
-from modules.model_io import ModelBundle, bundle_from_bytes, bundle_to_bytes, predict_with_bundle
+from modules.model_io import ModelBundle, ModelRunBundle, bundle_from_bytes, bundle_to_bytes, predict_with_bundle, predict_with_run_bundle
 from modules.models import MODEL_NAMES, build_pipeline, estimator_parameters
 from modules.pca_screening import compute_pca_screening
 from modules.plots import (
@@ -44,6 +44,7 @@ from modules.preprocessing import (
     drop_missing_rows,
 )
 from modules.splitting import random_split, sorted_endpoint_split, split_range_table
+from modules.statistical_tests import compare_endpoint_groups, endpoint_outlier_table
 
 
 st.set_page_config(
@@ -138,6 +139,8 @@ def init_state() -> None:
         "results_df": pd.DataFrame(),
         "last_run_warnings": [],
         "loaded_bundle": None,
+        "loaded_bundle_key": None,
+        "bundle_restore_messages": [],
         "prediction_output": None,
         "excluded_sample_ids": [],
         "outlier_log": pd.DataFrame(columns=["sample_id", "reason", "removed_at", "source"]),
@@ -641,6 +644,278 @@ def build_report_sheets(label: str, payload: dict[str, Any], all_results: pd.Dat
     }
 
 
+def _snapshot_value(value: Any) -> Any:
+    if isinstance(value, (pd.DataFrame, pd.Series)):
+        return value.copy()
+    if isinstance(value, list):
+        return list(value)
+    if isinstance(value, dict):
+        return dict(value)
+    return value
+
+
+def persisted_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    """Keep result data needed to restore the Results tab, excluding bulky figures."""
+
+    return {key: _snapshot_value(value) for key, value in payload.items() if key not in {"figures", "bundle"}}
+
+
+def build_run_state_snapshot() -> dict[str, Any]:
+    """Capture the UI/data state needed to reopen a completed modeling run."""
+
+    state_keys = [
+        "dataset",
+        "excluded_sample_ids",
+        "outlier_log",
+        "last_run_warnings",
+        "endpoint_method",
+        "preprocessing_config",
+        "split_config",
+        "drop_rows_after_split",
+        "model_config",
+        "feature_selection",
+        "split_preview",
+        "uploaded_name",
+    ]
+    widget_keys = [
+        "pca_components_input",
+        "pca_components_slider",
+        "scale_pca",
+        "pca_pc_x",
+        "pca_pc_y",
+        "endpoint_grouping_method",
+        "endpoint_statistical_test",
+        "endpoint_z_threshold",
+        "endpoint_iqr_multiplier",
+    ]
+    snapshot = {key: _snapshot_value(st.session_state[key]) for key in state_keys if key in st.session_state}
+    snapshot["pca_controls"] = {key: _snapshot_value(st.session_state[key]) for key in widget_keys if key in st.session_state}
+    return snapshot
+
+
+def _set_synced_int_state(key: str, value: Any) -> None:
+    try:
+        integer_value = int(value)
+    except Exception:
+        return
+    st.session_state[f"{key}_input"] = integer_value
+    st.session_state[f"{key}_slider"] = integer_value
+
+
+def _missing_label_from_config(config: PreprocessingConfig, drop_rows_after_split: bool) -> str:
+    if drop_rows_after_split:
+        return "Remove rows with missing descriptors after split"
+    reverse = {
+        "median_impute": "Median imputation",
+        "mean_impute": "Mean imputation",
+        "drop_columns": "Remove descriptor columns with missing values",
+        "none": "Require complete descriptor matrix",
+    }
+    return reverse.get(config.missing_strategy, "Median imputation")
+
+
+def apply_restored_config_to_widgets() -> None:
+    """Seed widget keys from restored configs before later tabs render."""
+
+    preprocessing_config = st.session_state.get("preprocessing_config")
+    if isinstance(preprocessing_config, PreprocessingConfig):
+        st.session_state["missing_label"] = _missing_label_from_config(
+            preprocessing_config,
+            bool(st.session_state.get("drop_rows_after_split", False)),
+        )
+        st.session_state["remove_constant"] = bool(preprocessing_config.remove_constant)
+        st.session_state["remove_low_variance"] = bool(preprocessing_config.remove_low_variance)
+        st.session_state["variance_threshold"] = float(preprocessing_config.variance_threshold)
+        st.session_state["remove_high_corr"] = bool(preprocessing_config.remove_high_correlation)
+        st.session_state["corr_threshold"] = float(preprocessing_config.correlation_threshold)
+
+    split_config = st.session_state.get("split_config")
+    if isinstance(split_config, dict) and split_config:
+        st.session_state["split_method"] = split_config.get("method", "Random split")
+        st.session_state["random_seed"] = int(split_config.get("random_state", 42))
+        if split_config.get("method") == "Random split":
+            st.session_state["test_size"] = float(split_config.get("test_size", 0.25))
+            st.session_state["use_stratified"] = split_config.get("stratify_bins") is not None
+            if split_config.get("stratify_bins") is not None:
+                st.session_state["stratify_bins"] = int(split_config.get("stratify_bins", 5))
+        else:
+            st.session_state["train_fraction"] = float(split_config.get("train_fraction", 0.75))
+            st.session_state["sorted_strategy"] = split_config.get("sorted_strategy", "systematic")
+
+    model_config = st.session_state.get("model_config")
+    if isinstance(model_config, dict) and model_config:
+        for key in ["scaler_name", "cv_folds", "cv_repeats", "ranking_metric", "selected_models"]:
+            if key in model_config:
+                st.session_state[key] = _snapshot_value(model_config[key])
+        for model_name, params in model_config.get("model_params", {}).items():
+            for param_name, value in params.items():
+                widget_key = f"{model_name}_{param_name}"
+                if param_name in {"n_components", "n_estimators"}:
+                    _set_synced_int_state(widget_key, value)
+                else:
+                    st.session_state[widget_key] = _snapshot_value(value)
+
+    feature_selection = st.session_state.get("feature_selection")
+    if isinstance(feature_selection, dict) and feature_selection:
+        method = feature_selection.get("method", "None")
+        params = feature_selection.get("params", {}) or {}
+        st.session_state["fs_method"] = method
+        st.session_state["manual_descriptors"] = params.get("manual_descriptors", [])
+        if "threshold" in params:
+            st.session_state["fs_variance_threshold"] = float(params["threshold"])
+        if "k" in params:
+            _set_synced_int_state("select_k_best_k", params["k"])
+        if "n_features" in params:
+            _set_synced_int_state("rfe_n_features", params["n_features"])
+        if method == "Genetic Algorithm":
+            st.session_state["use_ga_cv"] = int(params.get("cv_folds", 5)) >= 2
+            ga_synced = {
+                "population_size": "ga_population_size",
+                "generations": "ga_generations",
+                "cv_folds": "ga_cv_folds",
+                "early_stopping_rounds": "ga_early_stopping_rounds",
+                "min_descriptors": "ga_min_descriptors",
+                "max_descriptors": "ga_max_descriptors",
+                "candidate_count": "ga_candidate_count",
+                "keep_top_n": "ga_keep_top_n",
+            }
+            for param_name, key in ga_synced.items():
+                value = feature_selection.get(param_name, params.get(param_name))
+                if value is not None and not (param_name == "cv_folds" and int(value) < 2):
+                    _set_synced_int_state(key, value)
+            for param_name, key in {
+                "crossover_probability": "ga_crossover_probability",
+                "mutation_probability": "ga_mutation_probability",
+                "tournament_size": "ga_tournament_size",
+                "random_seed": "ga_random_seed",
+                "scoring_metric": "ga_scoring_metric",
+            }.items():
+                if param_name in params:
+                    st.session_state[key] = _snapshot_value(params[param_name])
+
+
+def build_selected_model_bundle(label: str, payload: dict[str, Any], results_df: pd.DataFrame) -> ModelBundle:
+    """Attach enough run state to a single-model export to restore the UI later."""
+
+    return replace(
+        payload["bundle"],
+        result_payload=persisted_payload(payload),
+        results_table=results_df.copy(),
+        session_state=build_run_state_snapshot(),
+    )
+
+
+def build_model_run_bundle(results: dict[str, dict[str, Any]], results_df: pd.DataFrame, ranking_metric: str) -> ModelRunBundle:
+    """Persist every kept model and the completed-run snapshot."""
+
+    created_at = datetime.now().isoformat(timespec="seconds")
+    bundles = {label: build_selected_model_bundle(label, payload, results_df) for label, payload in results.items()}
+    training_results = {label: persisted_payload(payload) for label, payload in results.items()}
+    return ModelRunBundle(
+        run_label=f"QSAR model run {created_at}",
+        bundles=bundles,
+        results_table=results_df.copy(),
+        metadata={
+            "created_at": created_at,
+            "ranking_metric": ranking_metric,
+            "kept_models": len(bundles),
+            "model_labels": list(bundles.keys()),
+            "bundle_format": "run_snapshot_v2",
+        },
+        training_results=training_results,
+        session_state=build_run_state_snapshot(),
+    )
+
+
+def restore_state_snapshot(snapshot: dict[str, Any]) -> bool:
+    if not snapshot:
+        return False
+    for key, value in snapshot.items():
+        if key == "pca_controls":
+            continue
+        st.session_state[key] = _snapshot_value(value)
+    for key, value in snapshot.get("pca_controls", {}).items():
+        st.session_state[key] = _snapshot_value(value)
+    if "dataset" in snapshot and "sheets" not in snapshot:
+        st.session_state.sheets = None
+    apply_restored_config_to_widgets()
+    return True
+
+
+def hydrate_saved_payloads(saved_results: dict[str, dict[str, Any]], bundles: dict[str, ModelBundle]) -> dict[str, dict[str, Any]]:
+    restored: dict[str, dict[str, Any]] = {}
+    for label, payload in saved_results.items():
+        hydrated = {key: _snapshot_value(value) for key, value in payload.items()}
+        if label in bundles:
+            hydrated["bundle"] = bundles[label]
+        try:
+            hydrated["figures"] = create_figures_for_result(label, hydrated)
+        except Exception as exc:
+            hydrated["figures"] = {}
+            hydrated.setdefault("warnings", []).append(f"Could not regenerate saved plots after loading bundle: {exc}")
+        restored[label] = hydrated
+    return restored
+
+
+def ensure_loaded_model_config(loaded: ModelBundle | ModelRunBundle) -> None:
+    ranking_metric = getattr(loaded, "metadata", {}).get("ranking_metric") or "R2 test"
+    current = st.session_state.get("model_config", {})
+    if not isinstance(current, dict):
+        current = {}
+    current.setdefault("ranking_metric", ranking_metric)
+    current.setdefault("selected_models", [])
+    current.setdefault("model_params", {})
+    current.setdefault("cv_folds", "restored")
+    current.setdefault("cv_repeats", "restored")
+    current.setdefault("scaler_name", "restored")
+    st.session_state.model_config = current
+
+
+def restore_loaded_bundle_to_session(loaded: ModelBundle | ModelRunBundle) -> list[tuple[str, str]]:
+    """Restore Results/PCA state when a saved bundle contains a run snapshot."""
+
+    messages: list[tuple[str, str]] = []
+    if isinstance(loaded, ModelRunBundle):
+        restored_state = restore_state_snapshot(getattr(loaded, "session_state", {}))
+        saved_results = getattr(loaded, "training_results", {}) or {}
+        if saved_results:
+            st.session_state.training_results = hydrate_saved_payloads(saved_results, loaded.bundles)
+            st.session_state.results_df = loaded.results_table.copy()
+            st.session_state.last_run_warnings = st.session_state.get("last_run_warnings", [])
+            ensure_loaded_model_config(loaded)
+            messages.append(("success", f"Restored full run snapshot with {len(st.session_state.training_results)} model(s)."))
+        else:
+            messages.append(("warning", "This run bundle contains model objects, but no saved Results/PCA snapshot. Re-export the run with the current app version to restore the full workflow."))
+        if restored_state:
+            messages.append(("info", "Restored dataset, PCA exclusions, and modeling configuration from the bundle."))
+        elif saved_results:
+            messages.append(("warning", "This bundle restored model results, but it does not contain the original dataset needed for PCA screening."))
+        return messages
+
+    restored_state = restore_state_snapshot(getattr(loaded, "session_state", {}))
+    saved_payload = getattr(loaded, "result_payload", {}) or {}
+    if saved_payload:
+        restored = hydrate_saved_payloads({loaded.model_label: saved_payload}, {loaded.model_label: loaded})
+        st.session_state.training_results = restored
+        table = getattr(loaded, "results_table", pd.DataFrame())
+        if not table.empty and "Model label" in table.columns:
+            table = table[table["Model label"] == loaded.model_label].copy()
+        st.session_state.results_df = table.copy() if not table.empty else pd.DataFrame([{"Model label": loaded.model_label, **loaded.statistics}])
+        ensure_loaded_model_config(loaded)
+        messages.append(("success", f"Restored saved model snapshot for {loaded.model_label}."))
+    else:
+        messages.append(("warning", "This older single-model bundle can be used for prediction, but it does not contain the saved Results/PCA workflow snapshot."))
+    if restored_state:
+        messages.append(("info", "Restored dataset and modeling configuration stored inside the selected model bundle."))
+    return messages
+
+
+def loaded_model_map(loaded: ModelBundle | ModelRunBundle) -> dict[str, ModelBundle]:
+    if isinstance(loaded, ModelRunBundle):
+        return loaded.bundles
+    return {loaded.model_label: loaded}
+
+
 def run_training_workflow(
     dataset,
     endpoint_method: str,
@@ -671,6 +946,10 @@ def run_training_workflow(
     progress = st.progress(0, text="Starting model training")
     results: dict[str, dict[str, Any]] = {}
     warnings: list[str] = []
+    if feature_selection["method"] == "Genetic Algorithm" and int(feature_selection.get("params", {}).get("cv_folds", 5)) < 2:
+        warnings.append(
+            "GA descriptor selection used training-score fitness only. This is faster, but final CV and external test statistics should drive model choice."
+        )
     job_counter = 0
 
     split = make_split(dataset.X, y, split_config)
@@ -851,6 +1130,142 @@ def run_training_workflow(
     return results, ranked, warnings
 
 
+def render_saved_bundle_loader() -> None:
+    model_upload = st.file_uploader("Saved model/run bundle (.joblib)", type=["joblib", "pkl"], key="bundle_upload")
+    if model_upload is not None:
+        bundle_bytes = model_upload.getvalue()
+        bundle_key = f"{model_upload.name}:{len(bundle_bytes)}"
+        if st.session_state.loaded_bundle_key != bundle_key:
+            try:
+                loaded = bundle_from_bytes(bundle_bytes)
+                if not isinstance(loaded, (ModelBundle, ModelRunBundle)):
+                    raise TypeError("The uploaded file is not a QSAR model bundle.")
+                st.session_state.loaded_bundle = loaded
+                st.session_state.loaded_bundle_key = bundle_key
+                st.session_state.prediction_output = None
+                st.session_state.bundle_restore_messages = restore_loaded_bundle_to_session(loaded)
+                if isinstance(loaded, ModelRunBundle):
+                    st.success(f"Loaded model run: {loaded.run_label} ({len(loaded.bundles)} models)")
+                else:
+                    st.success(f"Loaded model: {loaded.model_label}")
+            except Exception as exc:
+                st.session_state.loaded_bundle = None
+                st.session_state.loaded_bundle_key = None
+                st.session_state.bundle_restore_messages = []
+                st.error(f"Could not load model bundle: {exc}")
+
+    for level, message in st.session_state.bundle_restore_messages:
+        if level == "success":
+            st.success(message)
+        elif level == "warning":
+            st.warning(message)
+        else:
+            st.info(message)
+
+    if st.session_state.loaded_bundle is None:
+        st.caption("Upload a current full-run bundle to restore PCA screening, preprocessing, split, feature selection, results, plots, and export state.")
+        return
+
+    loaded = st.session_state.loaded_bundle
+    model_map = loaded_model_map(loaded)
+    is_run_bundle = isinstance(loaded, ModelRunBundle)
+
+    if is_run_bundle:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            metric_panel("Bundle type", "Full run")
+        with c2:
+            metric_panel("Models", len(model_map))
+        with c3:
+            metric_panel("Ranking rows", len(loaded.results_table))
+
+        if not loaded.results_table.empty:
+            with st.expander("Loaded run ranking table", expanded=False):
+                st.dataframe(loaded.results_table, use_container_width=True)
+
+        selected_loaded_label = st.selectbox("Inspect model from loaded run", list(model_map.keys()), key="loaded_run_model")
+        bundle = model_map[selected_loaded_label]
+        st.info("Prediction on a new descriptor workbook will be executed for every model in this loaded run package.")
+    else:
+        bundle = next(iter(model_map.values()))
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        metric_panel("Model", bundle.model_name)
+    with c2:
+        metric_panel("Descriptors", len(bundle.selected_descriptors))
+    with c3:
+        metric_panel("Endpoint", bundle.metadata.get("endpoint_name", "n/a"))
+
+    with st.expander("Loaded bundle metadata", expanded=False):
+        if is_run_bundle:
+            st.caption("Run metadata")
+            st.json(loaded.metadata)
+        st.caption("Selected/inspected model metadata")
+        st.json(bundle.metadata)
+        st.dataframe(list_to_frame(bundle.selected_descriptors), use_container_width=True)
+
+    with st.expander("Predict new compounds with loaded bundle", expanded=False):
+        new_data = st.file_uploader("New descriptor workbook", type=["xlsx", "xlsm", "xls"], key="new_data_upload")
+        if new_data is not None:
+            try:
+                new_sheets = cached_read_excel_sheets(new_data.getvalue())
+                new_sheet_name = st.selectbox("Descriptor sheet for prediction", list(new_sheets.keys()))
+                use_new_id = st.checkbox("Use first column as sample ID for prediction", value=False, key="new_use_id")
+                X_new = clean_sheet(new_sheets[new_sheet_name], use_first_column_as_index=use_new_id)
+                st.dataframe(X_new.head(20), use_container_width=True)
+                if st.button("Predict new compounds", type="primary"):
+                    if is_run_bundle:
+                        predictions, ad_table, errors = predict_with_run_bundle(loaded, X_new)
+                    else:
+                        predictions, ad_table = predict_with_bundle(bundle, X_new)
+                        errors = pd.DataFrame()
+                    st.session_state.prediction_output = {
+                        "predictions": predictions,
+                        "ad": ad_table,
+                        "errors": errors,
+                        "is_run_bundle": is_run_bundle,
+                    }
+            except Exception as exc:
+                st.error(f"Could not prepare new descriptors: {exc}")
+
+        if st.session_state.prediction_output is not None:
+            predictions = st.session_state.prediction_output["predictions"]
+            ad_table = st.session_state.prediction_output["ad"]
+            errors = st.session_state.prediction_output.get("errors", pd.DataFrame())
+
+            if predictions.empty:
+                st.error("No predictions were generated. Check descriptor names and preprocessing compatibility with the saved model bundle.")
+            else:
+                st.caption("New compound predictions")
+                st.dataframe(predictions, use_container_width=True)
+
+            if errors is not None and not errors.empty:
+                st.warning("Some models from the loaded run could not predict these descriptors.")
+                st.dataframe(errors, use_container_width=True)
+
+            if not ad_table.empty:
+                st.caption("Applicability-domain assessment")
+                st.dataframe(ad_table, use_container_width=True)
+                if ad_table["outside_ad"].any():
+                    st.warning("One or more new compounds are outside the saved model distance-based applicability domain.")
+
+            export_predictions = predictions.copy()
+            if not export_predictions.empty and not ad_table.empty:
+                ad_export = ad_table.drop(columns=["split", "model_name"], errors="ignore")
+                merge_keys = ["sample_id"]
+                if "model_label" in export_predictions.columns and "model_label" in ad_export.columns:
+                    merge_keys = ["model_label", "sample_id"]
+                export_predictions = export_predictions.merge(ad_export, on=merge_keys, how="left")
+            if not export_predictions.empty:
+                st.download_button(
+                    "Download new predictions CSV",
+                    data=dataframe_to_csv_bytes(export_predictions.reset_index(drop=True)),
+                    file_name="new_compound_predictions.csv",
+                    mime="text/csv",
+                )
+
+
 def show_dataset_gate():
     if st.session_state.dataset is None:
         st.info("Upload and align a workbook in Data upload to activate this section.")
@@ -877,19 +1292,26 @@ tabs = st.tabs(
         "7. Training and validation",
         "8. Results and plots",
         "9. Export",
-        "10. Data loading",
     ]
 )
 
 
 with tabs[0]:
     st.subheader("Data upload")
+    st.markdown("#### Restore saved run or model")
+    render_saved_bundle_loader()
+    st.divider()
+    st.markdown("#### Start from Excel workbook")
     uploaded = st.file_uploader("Excel workbook", type=["xlsx", "xlsm", "xls"])
     if uploaded is not None and uploaded.name != st.session_state.uploaded_name:
         try:
             st.session_state.sheets = cached_read_excel_sheets(uploaded.getvalue())
             st.session_state.uploaded_name = uploaded.name
             st.session_state.dataset = None
+            st.session_state.loaded_bundle = None
+            st.session_state.loaded_bundle_key = None
+            st.session_state.bundle_restore_messages = []
+            st.session_state.prediction_output = None
             st.session_state.excluded_sample_ids = []
             st.session_state.outlier_log = pd.DataFrame(columns=["sample_id", "reason", "removed_at", "source"])
             reset_modeling_outputs()
@@ -898,8 +1320,8 @@ with tabs[0]:
             st.session_state.sheets = None
             st.error(f"Could not read workbook: {exc}")
 
-    if uploaded is None and not st.session_state.sheets:
-        st.info("Upload an Excel workbook to begin. The app will then ask for descriptor, endpoint, and optional SMILES sheets.")
+    if uploaded is None and not st.session_state.sheets and st.session_state.dataset is None and st.session_state.loaded_bundle is None:
+        st.info("Upload an Excel workbook to begin, or restore a saved .joblib run above.")
 
     if st.session_state.sheets:
         sheets = st.session_state.sheets
@@ -955,6 +1377,10 @@ with tabs[0]:
                     smiles_column=smiles_column,
                 )
                 st.session_state.dataset = dataset
+                st.session_state.loaded_bundle = None
+                st.session_state.loaded_bundle_key = None
+                st.session_state.bundle_restore_messages = []
+                st.session_state.prediction_output = None
                 st.session_state.excluded_sample_ids = []
                 st.session_state.outlier_log = pd.DataFrame(columns=["sample_id", "reason", "removed_at", "source"])
                 reset_modeling_outputs()
@@ -1065,6 +1491,109 @@ with tabs[1]:
 
                 with st.expander("PCA preprocessing summary", expanded=False):
                     st.dataframe(pca_result.preprocessing, use_container_width=True)
+
+                with st.expander("Endpoint statistical screening", expanded=False):
+                    st.caption(
+                        "Exploratory tests compare PCA-score distributions between endpoint-defined groups. "
+                        "Use this as a signal for review, not as automatic proof that a compound should be removed."
+                    )
+                    stat_cols = st.columns(4)
+                    with stat_cols[0]:
+                        grouping_method = st.selectbox(
+                            "Endpoint groups",
+                            ["Lower vs upper quartile", "Median split"],
+                            key="endpoint_grouping_method",
+                        )
+                    with stat_cols[1]:
+                        statistical_test = st.selectbox(
+                            "Statistical test",
+                            ["Welch t-test", "Student t-test", "Mann-Whitney U"],
+                            key="endpoint_statistical_test",
+                        )
+                    with stat_cols[2]:
+                        z_threshold = st.number_input(
+                            "Endpoint z threshold",
+                            min_value=1.0,
+                            max_value=10.0,
+                            value=3.0,
+                            step=0.25,
+                            key="endpoint_z_threshold",
+                        )
+                    with stat_cols[3]:
+                        iqr_multiplier = st.number_input(
+                            "IQR multiplier",
+                            min_value=0.5,
+                            max_value=5.0,
+                            value=1.5,
+                            step=0.25,
+                            key="endpoint_iqr_multiplier",
+                        )
+                    try:
+                        stat_table, endpoint_grouping = compare_endpoint_groups(
+                            pca_result.scores,
+                            dataset.y,
+                            score_cols,
+                            grouping_method=grouping_method,
+                            test_name=statistical_test,
+                        )
+                        st.caption(endpoint_grouping.description)
+                        st.dataframe(
+                            stat_table.style.format(
+                                {
+                                    "low_mean": "{:.5g}",
+                                    "high_mean": "{:.5g}",
+                                    "mean_difference_high_minus_low": "{:.5g}",
+                                    "effect_size_cohens_d": "{:.4f}",
+                                    "statistic": "{:.4g}",
+                                    "p_value": "{:.4g}",
+                                }
+                            ),
+                            use_container_width=True,
+                        )
+                    except Exception as exc:
+                        st.warning(f"Endpoint group comparison could not be calculated: {exc}")
+
+                    endpoint_flags = endpoint_outlier_table(
+                        dataset.y,
+                        z_threshold=z_threshold,
+                        iqr_multiplier=iqr_multiplier,
+                    )
+                    flagged_endpoint_ids = endpoint_flags.loc[endpoint_flags["flagged"], "sample_id"].astype(str).tolist()
+                    st.caption("Endpoint outlier flags")
+                    st.dataframe(
+                        endpoint_flags.style.format(
+                            {
+                                "endpoint": "{:.5g}",
+                                "z_score": "{:.4f}",
+                                "iqr_lower_fence": "{:.5g}",
+                                "iqr_upper_fence": "{:.5g}",
+                            }
+                        ),
+                        use_container_width=True,
+                    )
+                    if flagged_endpoint_ids:
+                        st.warning(f"Endpoint statistical screening flagged {len(flagged_endpoint_ids)} sample(s). Review before excluding.")
+                        if st.button("Exclude endpoint-flagged samples", key="exclude_endpoint_flags"):
+                            existing = {str(sample_id) for sample_id in st.session_state.excluded_sample_ids}
+                            new_ids = [sample_id for sample_id in flagged_endpoint_ids if sample_id not in existing]
+                            if new_ids:
+                                st.session_state.excluded_sample_ids = sorted(existing.union(new_ids))
+                                new_log = pd.DataFrame(
+                                    {
+                                        "sample_id": new_ids,
+                                        "reason": "Endpoint statistical screening",
+                                        "removed_at": datetime.now().isoformat(timespec="seconds"),
+                                        "source": "PCA endpoint statistics",
+                                    }
+                                )
+                                st.session_state.outlier_log = pd.concat(
+                                    [st.session_state.outlier_log, new_log],
+                                    ignore_index=True,
+                                )
+                                reset_modeling_outputs()
+                                st.rerun()
+                    else:
+                        st.success("No endpoint outliers were flagged by the selected z-score/IQR rules.")
 
                 st.markdown("#### Remove outliers from modeling")
                 selectable_ids = pca_result.scores["sample_id"].astype(str).tolist()
@@ -1344,14 +1873,17 @@ with tabs[5]:
             key="fs_method",
         )
         fs_params: dict[str, Any] = {}
+        candidate_count = 1
+        keep_top_n = max(1, len(st.session_state.get("selected_models", [])))
         if fs_method == "Manual":
             fs_params["manual_descriptors"] = st.multiselect(
                 "Manual descriptors",
                 dataset.X.columns.tolist(),
                 default=dataset.X.columns[: min(10, dataset.X.shape[1])].tolist(),
+                key="manual_descriptors",
             )
         elif fs_method == "Variance threshold":
-            fs_params["threshold"] = st.number_input("Selection variance threshold", min_value=0.0, value=0.01, step=0.01)
+            fs_params["threshold"] = st.number_input("Selection variance threshold", min_value=0.0, value=0.01, step=0.01, key="fs_variance_threshold")
         elif fs_method == "SelectKBest":
             fs_params["k"] = synced_int_control(
                 "Number of descriptors",
@@ -1371,16 +1903,26 @@ with tabs[5]:
                 "rfe_n_features",
             )
         elif fs_method == "Genetic Algorithm":
-            st.info("GA selection uses cross-validation fitness and can take longer on wide descriptor matrices.")
+            st.info("GA can score each descriptor subset with internal CV, or skip GA CV for a much faster training-score search.")
+            use_ga_cv = st.checkbox(
+                "Use cross-validation inside GA fitness",
+                value=True,
+                key="use_ga_cv",
+                help="Disable this when you want GA to search quickly and leave CV only for the final trained model metrics.",
+            )
             g1, g2, g3 = st.columns(3)
             with g1:
                 fs_params["population_size"] = synced_int_control("Population size", 6, 500, 30, 2, "ga_population_size")
                 fs_params["generations"] = synced_int_control("Generations", 1, 500, 20, 1, "ga_generations")
-                fs_params["cv_folds"] = st.slider("GA CV folds", 2, 10, 5)
+                if use_ga_cv:
+                    fs_params["cv_folds"] = synced_int_control("GA CV folds", 2, 10, 5, 1, "ga_cv_folds")
+                else:
+                    fs_params["cv_folds"] = 0
+                    st.warning("GA CV is disabled. GA will optimize training-set score only, so final CV/test metrics are the real check for overfitting.")
             with g2:
-                fs_params["crossover_probability"] = st.slider("Crossover probability", 0.0, 1.0, 0.8, 0.05)
-                fs_params["mutation_probability"] = st.slider("Mutation probability", 0.0, 0.5, 0.05, 0.01)
-                fs_params["tournament_size"] = st.slider("Tournament size", 2, 10, 3)
+                fs_params["crossover_probability"] = st.slider("Crossover probability", 0.0, 1.0, 0.8, 0.05, key="ga_crossover_probability")
+                fs_params["mutation_probability"] = st.slider("Mutation probability", 0.0, 0.5, 0.05, 0.01, key="ga_mutation_probability")
+                fs_params["tournament_size"] = st.slider("Tournament size", 2, 10, 3, key="ga_tournament_size")
                 fs_params["early_stopping_rounds"] = synced_int_control("Early stopping generations", 0, 100, 10, 1, "ga_early_stopping_rounds")
             with g3:
                 fs_params["min_descriptors"] = synced_int_control(
@@ -1399,10 +1941,11 @@ with tabs[5]:
                     1,
                     "ga_max_descriptors",
                 )
-                fs_params["random_seed"] = st.number_input("GA random seed", min_value=0, value=42, step=1)
+                fs_params["random_seed"] = st.number_input("GA random seed", min_value=0, value=42, step=1, key="ga_random_seed")
             fs_params["scoring_metric"] = st.selectbox(
                 "GA scoring metric",
                 ["Q2 / CV R2", "R2", "RMSE", "MAE", "Combined score"],
+                key="ga_scoring_metric",
             )
             st.markdown("#### Candidate model search")
             c1, c2 = st.columns(2)
@@ -1426,10 +1969,6 @@ with tabs[5]:
                     "ga_keep_top_n",
                 )
             st.caption("Each candidate uses the same train/test split, but GA receives a different seed and may select a different descriptor subset.")
-        else:
-            candidate_count = 1
-            keep_top_n = max(1, len(st.session_state.get("selected_models", [])))
-
         st.session_state.feature_selection = {
             "method": fs_method,
             "params": fs_params,
@@ -1465,9 +2004,15 @@ with tabs[6]:
             with summary_cols[5]:
                 metric_panel("Scaler", config["scaler_name"])
 
-            fs_cols = st.columns(1)
+            fs_cols = st.columns(2)
             with fs_cols[0]:
                 metric_panel("Feature selection", st.session_state.feature_selection["method"])
+            with fs_cols[1]:
+                if st.session_state.feature_selection["method"] == "Genetic Algorithm":
+                    ga_folds = int(st.session_state.feature_selection.get("params", {}).get("cv_folds", 5))
+                    metric_panel("GA fitness", f"{ga_folds}-fold CV" if ga_folds >= 2 else "Training score")
+                else:
+                    metric_panel("GA fitness", "n/a")
 
             if st.button("Run training workflow", type="primary"):
                 try:
@@ -1628,6 +2173,11 @@ with tabs[8]:
         payload = results[selected_label]
         export_stem = safe_file_stem(selected_label)
         report_sheets = build_report_sheets(selected_label, payload, st.session_state.results_df)
+        run_bundle = build_model_run_bundle(
+            results,
+            st.session_state.results_df,
+            st.session_state.model_config["ranking_metric"],
+        )
 
         e1, e2, e3 = st.columns(3)
         with e1:
@@ -1657,11 +2207,20 @@ with tabs[8]:
                 file_name=f"{export_stem}_removed_descriptors.csv",
                 mime="text/csv",
             )
+            selected_model_bundle = build_selected_model_bundle(selected_label, payload, st.session_state.results_df)
             st.download_button(
-                "Download model bundle",
-                data=bundle_to_bytes(payload["bundle"]),
+                "Download selected model bundle",
+                data=bundle_to_bytes(selected_model_bundle),
                 file_name=f"{export_stem}_model.joblib",
                 mime="application/octet-stream",
+                help="Contains this model plus the run snapshot needed to restore Results and PCA context.",
+            )
+            st.download_button(
+                "Download full run bundle",
+                data=bundle_to_bytes(run_bundle),
+                file_name=f"{safe_file_stem(run_bundle.run_label)}.joblib",
+                mime="application/octet-stream",
+                help="Contains all kept models from this run, their preprocessing, selected descriptors, metadata, and ranking table.",
             )
         with e3:
             image_format = st.selectbox("Plot image format", ["png", "jpg"])
@@ -1677,65 +2236,4 @@ with tabs[8]:
                 data=fig_to_bytes(payload["figures"][single_plot], fmt=image_format),
                 file_name=f"{safe_file_stem(single_plot.lower())}.{image_format}",
                 mime=f"image/{'jpeg' if image_format == 'jpg' else 'png'}",
-            )
-
-
-with tabs[9]:
-    st.subheader("Data loading")
-    model_upload = st.file_uploader("Saved model bundle", type=["joblib", "pkl"], key="bundle_upload")
-    if model_upload is not None:
-        try:
-            st.session_state.loaded_bundle = bundle_from_bytes(model_upload.getvalue())
-            st.success(f"Loaded model: {st.session_state.loaded_bundle.model_label}")
-        except Exception as exc:
-            st.error(f"Could not load model bundle: {exc}")
-
-    if st.session_state.loaded_bundle is not None:
-        bundle = st.session_state.loaded_bundle
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            metric_panel("Model", bundle.model_name)
-        with c2:
-            metric_panel("Descriptors", len(bundle.selected_descriptors))
-        with c3:
-            metric_panel("Endpoint", bundle.metadata.get("endpoint_name", "n/a"))
-
-        with st.expander("Loaded model metadata", expanded=False):
-            st.json(bundle.metadata)
-            st.dataframe(list_to_frame(bundle.selected_descriptors), use_container_width=True)
-
-        new_data = st.file_uploader("New descriptor workbook", type=["xlsx", "xlsm", "xls"], key="new_data_upload")
-        if new_data is not None:
-            try:
-                new_sheets = cached_read_excel_sheets(new_data.getvalue())
-                new_sheet_name = st.selectbox("Descriptor sheet for prediction", list(new_sheets.keys()))
-                use_new_id = st.checkbox("Use first column as sample ID for prediction", value=False, key="new_use_id")
-                X_new = clean_sheet(new_sheets[new_sheet_name], use_first_column_as_index=use_new_id)
-                st.dataframe(X_new.head(20), use_container_width=True)
-                if st.button("Predict new compounds", type="primary"):
-                    predictions, ad_table = predict_with_bundle(bundle, X_new)
-                    st.session_state.prediction_output = {"predictions": predictions, "ad": ad_table}
-            except Exception as exc:
-                st.error(f"Could not prepare new descriptors: {exc}")
-
-        if st.session_state.prediction_output is not None:
-            predictions = st.session_state.prediction_output["predictions"]
-            ad_table = st.session_state.prediction_output["ad"]
-            st.dataframe(predictions, use_container_width=True)
-            if not ad_table.empty:
-                st.dataframe(ad_table, use_container_width=True)
-                if ad_table["outside_ad"].any():
-                    st.warning("One or more new compounds are outside the saved model's distance-based applicability domain.")
-            export_predictions = predictions.copy()
-            if not ad_table.empty:
-                export_predictions = export_predictions.merge(
-                    ad_table.drop(columns=["split"], errors="ignore"),
-                    on="sample_id",
-                    how="left",
-                )
-            st.download_button(
-                "Download new predictions CSV",
-                data=dataframe_to_csv_bytes(export_predictions.reset_index(drop=True)),
-                file_name="new_compound_predictions.csv",
-                mime="text/csv",
             )

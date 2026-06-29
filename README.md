@@ -4,25 +4,25 @@ A Streamlit application for building, validating, saving, loading, and visualizi
 
 ## Features
 
-- Excel upload with sheet selection for descriptors `X` and endpoint `y`
+- Excel upload with sheet selection for descriptors `X` and endpoint `y`, plus saved `.joblib` run/model restore from the first Data upload step
 - Endpoint column selection and row alignment by workbook row index or first-column sample IDs
 - Optional SMILES column selection for structure lookup and hover context in PCA/Williams plots
 - Automatic removal of endpoint leakage columns and common report/model artifact columns accidentally present in descriptor sheets
 - Dataset preview, missing-value diagnostics, endpoint statistics, and descriptor statistics
-- Exploratory PCA screening before modeling with eigenvalues, explained variance, selectable PC axes, hoverable sample IDs, and outlier exclusion history
+- Exploratory PCA screening before modeling with eigenvalues, explained variance, selectable PC axes, hoverable sample IDs, endpoint statistical screening, and outlier exclusion history
 - Leakage-aware preprocessing fitted on the training set only
 - Endpoint transformations: none, `log10(y)`, and `-log10(y)`
 - Random split with optional binned-y stratification
 - Sorted endpoint split that keeps minimum and maximum endpoint samples in training
 - Scaling options: none, `StandardScaler`, `MinMaxScaler`, `RobustScaler`
 - Regression models: MLR, PCR, PLS, SVR, Random Forest, AdaBoost, Gradient Boosting
-- Feature selection: none, manual, variance threshold, SelectKBest, RFE, and a built-in genetic algorithm
+- Feature selection: none, manual, variance threshold, SelectKBest, RFE, and a built-in genetic algorithm with optional internal CV
 - Cross-validation, repeated CV, train/test validation metrics, ranked model table, and diagnostic warnings
 - Single-split GA candidate model search with cached subset scoring, early stopping, progress feedback, and configurable top-N retention
 - Plots: endpoint histogram, interactive observed vs predicted with sample ID hover, residuals, CV scores, interactive Williams plot with sample ID hover, distance-based AD, PCA AD, PCR variance, RF importance, GA progress
-- Export of reports, predictions, selected and removed descriptors, plots, and complete joblib model bundles
+- Export of reports, predictions, selected and removed descriptors, plots, selected model bundles, and full-run joblib bundles containing every kept model
 - Exported reports include samples excluded during PCA/outlier review
-- Load saved models and predict new compound descriptor workbooks with applicability-domain assessment
+- Load saved single-model bundles or full-run bundles; new bundles restore Results/PCA context and full-run prediction is executed for every model in the package
 
 ## Project Structure
 
@@ -41,6 +41,7 @@ modules/
   chemistry.py
   preprocessing.py
   splitting.py
+  statistical_tests.py
 requirements.txt
 requirements-rdkit.txt
 tests/
@@ -96,6 +97,10 @@ If compounds have IDs, place them in the first column of both sheets and enable 
 ## Scientific Notes
 
 Preprocessing that depends on descriptor distributions is fitted only on `X_train` and then applied to `X_test` and future prediction data. Scaling is part of the sklearn model pipeline, so cross-validation refits the scaler inside each fold. The test set remains external to model fitting and descriptor-selection fitting. Excel loading and exploratory PCA screening are cached by Streamlit to reduce avoidable recalculation during UI interaction.
+
+GA descriptor selection can use internal cross-validation fitness or a faster training-score-only mode. Training-score GA is useful for expensive searches, but model choice should still be based on the final training/CV/external-test statistics.
+
+Joblib exports created with the current app version include a run snapshot. Load them in `1. Data upload` to restore model results, plots, dataset context, PCA exclusions, preprocessing, split, model configuration, and feature-selection settings. Older joblib files still load for prediction, but they cannot recreate Results/PCA views because those data were not stored in the file.
 
 The Williams plot uses leverage from the selected descriptor matrix and standardized residual limits of `+/- 3`. The distance-based applicability-domain plot is an Insubria-style proxy based on distance to the training-set centroid in standardized descriptor space.
 

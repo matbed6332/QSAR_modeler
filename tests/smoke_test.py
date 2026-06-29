@@ -10,8 +10,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from modules.applicability_domain import distance_domain_results, williams_results
 from modules.evaluation import evaluate_fitted_model
 from modules.feature_selection import FeatureSelector
+from modules.statistical_tests import compare_endpoint_groups, endpoint_outlier_table
 from modules.data_loader import endpoint_transform_preview, prepare_xy
-from modules.model_io import ModelBundle, bundle_from_bytes, bundle_to_bytes, predict_with_bundle
+from modules.model_io import ModelBundle, ModelRunBundle, bundle_from_bytes, bundle_to_bytes, predict_with_bundle, predict_with_run_bundle
 from modules.models import build_pipeline
 from modules.pca_screening import compute_pca_screening
 from modules.preprocessing import DescriptorPreprocessor, EndpointTransformer, PreprocessingConfig
@@ -40,6 +41,17 @@ def main() -> None:
     pca_screen = compute_pca_screening(X, y, n_components=4)
     assert {"sample_id", "endpoint", "PC1", "PC2"}.issubset(pca_screen.scores.columns)
     assert len(pca_screen.variance) == 4
+    stat_table, grouping = compare_endpoint_groups(
+        pca_screen.scores,
+        y,
+        ["PC1", "PC2"],
+        grouping_method="Lower vs upper quartile",
+        test_name="Welch t-test",
+    )
+    assert stat_table.shape[0] == 2
+    assert grouping.low_label == "low_endpoint"
+    endpoint_flags = endpoint_outlier_table(y)
+    assert {"sample_id", "endpoint", "flagged"}.issubset(endpoint_flags.columns)
 
     x_sheet = pd.DataFrame(
         {
@@ -81,6 +93,38 @@ def main() -> None:
     )
     X_train = preprocessor.fit_transform(split.X_train, split.y_train)
     X_test = preprocessor.transform(split.X_test)
+
+    for method, params in [
+        ("None", {}),
+        ("Manual", {"manual_descriptors": X_train.columns[:3].tolist()}),
+        ("Variance threshold", {"threshold": 0.0}),
+        ("SelectKBest", {"k": min(5, X_train.shape[1])}),
+        ("RFE", {"n_features": min(3, X_train.shape[1])}),
+    ]:
+        smoke_selector = FeatureSelector(method, params)
+        selected_train = smoke_selector.fit_transform(X_train, split.y_train)
+        selected_test = smoke_selector.transform(X_test)
+        assert selected_train.shape[1] >= 1
+        assert selected_test.shape[1] == selected_train.shape[1]
+
+    ga_selector = FeatureSelector(
+        "Genetic Algorithm",
+        {
+            "population_size": 6,
+            "generations": 2,
+            "min_descriptors": 1,
+            "max_descriptors": min(4, X_train.shape[1]),
+            "cv_folds": 0,
+            "random_seed": 42,
+        },
+    )
+    X_ga = ga_selector.fit_transform(
+        X_train,
+        split.y_train,
+        estimator_factory=lambda n=None: build_pipeline("MLR / Linear Regression", {"fit_intercept": True}, "StandardScaler"),
+    )
+    assert X_ga.shape[1] >= 1
+    assert set(ga_selector.ga_history_["validation_mode"]) == {"Training score"}
 
     selector = FeatureSelector("SelectKBest", {"k": min(5, X_train.shape[1])})
     X_train_selected = selector.fit_transform(X_train, split.y_train)
@@ -133,11 +177,32 @@ def main() -> None:
         selected_descriptors=selector.selected_descriptors_,
         train_reference_X=X_train_selected,
         statistics=evaluation.metrics,
+        result_payload={"model_name": "MLR / Linear Regression"},
+        results_table=pd.DataFrame({"Model label": ["smoke"]}),
+        session_state={"excluded_sample_ids": ["cmpd_001"]},
     )
     loaded = bundle_from_bytes(bundle_to_bytes(bundle))
+    assert loaded.result_payload["model_name"] == "MLR / Linear Regression"
+    assert loaded.session_state["excluded_sample_ids"] == ["cmpd_001"]
     predictions, ad = predict_with_bundle(loaded, X.head(5))
     assert len(predictions) == 5
     assert len(ad) == 5
+
+    run_bundle = ModelRunBundle(
+        run_label="smoke run",
+        bundles={"smoke": bundle, "smoke copy": bundle},
+        results_table=pd.DataFrame({"Model label": ["smoke", "smoke copy"]}),
+        training_results={"smoke": {"model_name": "MLR / Linear Regression"}},
+        session_state={"excluded_sample_ids": ["cmpd_001"]},
+    )
+    loaded_run = bundle_from_bytes(bundle_to_bytes(run_bundle))
+    assert isinstance(loaded_run, ModelRunBundle)
+    assert loaded_run.training_results["smoke"]["model_name"] == "MLR / Linear Regression"
+    assert loaded_run.session_state["excluded_sample_ids"] == ["cmpd_001"]
+    run_predictions, run_ad, run_errors = predict_with_run_bundle(loaded_run, X.head(5))
+    assert len(run_predictions) == 10
+    assert len(run_ad) == 10
+    assert run_errors.empty
     print("Smoke test passed")
 
 

@@ -10,6 +10,7 @@ import pandas as pd
 from sklearn.base import BaseEstimator, TransformerMixin, clone
 from sklearn.feature_selection import RFE, SelectKBest, VarianceThreshold, f_regression
 from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from sklearn.model_selection import KFold, cross_val_score
 
 
@@ -28,6 +29,18 @@ def _scoring_name(metric: str) -> str:
     if metric == "MAE":
         return "neg_mean_absolute_error"
     return "r2"
+
+
+def _prediction_score(y_true: pd.Series, y_pred: np.ndarray, metric: str) -> float:
+    """Return a maximized score matching the GA metric labels."""
+
+    if metric == "RMSE":
+        return -float(np.sqrt(mean_squared_error(y_true, y_pred)))
+    if metric == "MAE":
+        return -float(mean_absolute_error(y_true, y_pred))
+    if len(y_true) < 2:
+        return -np.inf
+    return float(r2_score(y_true, y_pred))
 
 
 def _repair_mask(mask: np.ndarray, rng: np.random.Generator, min_features: int, max_features: int) -> np.ndarray:
@@ -60,11 +73,16 @@ def run_genetic_algorithm_selection(
     random_seed: int = 42,
     early_stopping_rounds: int = 0,
 ) -> GAResult:
-    """Run a compact GA over descriptor bitmasks using cross-validation fitness.
+    """Run a compact GA over descriptor bitmasks.
 
     Fitness values are cached by descriptor bitmask so repeated subsets are
     not refitted. Optional early stopping ends the search when the best
     score has not improved for the requested number of generations.
+
+    When cv_folds is lower than 2, the GA uses training-set fitness only.
+    That mode is much faster for expensive models, but it is intentionally
+    more prone to overfitting and should be judged by the final model CV/test
+    statistics rather than the GA fitness alone.
     """
 
     if X.empty:
@@ -76,10 +94,16 @@ def run_genetic_algorithm_selection(
     min_descriptors = min(max(1, min_descriptors), max_descriptors)
     population_size = max(4, int(population_size))
     tournament_size = max(2, min(int(tournament_size), population_size))
-    cv_folds = max(2, min(int(cv_folds), len(y)))
     early_stopping_rounds = max(0, int(early_stopping_rounds))
-    cv = KFold(n_splits=cv_folds, shuffle=True, random_state=random_seed)
+    cv_folds = int(cv_folds)
+    use_cv_fitness = cv_folds >= 2 and len(y) >= 2
+    if use_cv_fitness:
+        cv_folds = max(2, min(cv_folds, len(y)))
+        cv = KFold(n_splits=cv_folds, shuffle=True, random_state=random_seed)
+    else:
+        cv = None
     scoring = _scoring_name(scoring_metric)
+    validation_mode = f"{cv_folds}-fold CV" if use_cv_fitness else "Training score"
     cache: dict[tuple[bool, ...], float] = {}
 
     def random_mask() -> np.ndarray:
@@ -99,8 +123,13 @@ def run_genetic_algorithm_selection(
         except TypeError:
             estimator = estimator_factory()
         try:
-            scores = cross_val_score(clone(estimator), X_subset, y, cv=cv, scoring=scoring)
-            score = float(np.nanmean(scores))
+            if use_cv_fitness and cv is not None:
+                scores = cross_val_score(clone(estimator), X_subset, y, cv=cv, scoring=scoring)
+                score = float(np.nanmean(scores))
+            else:
+                fitted = clone(estimator).fit(X_subset, y)
+                predictions = np.asarray(fitted.predict(X_subset)).ravel()
+                score = _prediction_score(y, predictions, scoring_metric)
         except Exception:
             score = -np.inf
         if scoring_metric == "Combined score" and np.isfinite(score):
@@ -114,7 +143,7 @@ def run_genetic_algorithm_selection(
         return population[best_idx].copy()
 
     population = [random_mask() for _ in range(population_size)]
-    history_rows: list[dict[str, float | int | bool]] = []
+    history_rows: list[dict[str, float | int | bool | str]] = []
     best_score_seen = -np.inf
     stale_generations = 0
 
@@ -137,6 +166,7 @@ def run_genetic_algorithm_selection(
                 "mean_score": float(np.mean(finite_scores)) if finite_scores else np.nan,
                 "best_descriptor_count": int(population[best_idx].sum()),
                 "evaluated_subsets": int(len(cache)),
+                "validation_mode": validation_mode,
                 "early_stopped": early_stop,
             }
         )
