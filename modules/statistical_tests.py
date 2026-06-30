@@ -65,7 +65,7 @@ def compare_endpoint_groups(
     grouping_method: str = "Lower vs upper quartile",
     test_name: str = "Welch t-test",
 ) -> tuple[pd.DataFrame, EndpointGrouping]:
-    """Compare PCA score distributions between low/high endpoint groups."""
+    """Compare numeric variable distributions between low/high endpoint groups."""
 
     grouping = endpoint_groups(y, grouping_method)
     aligned = pd.DataFrame(scores).reindex(grouping.labels.index)

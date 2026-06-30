@@ -1,32 +1,24 @@
-"""Optional RDKit helpers for rendering structures from SMILES."""
+"""RDKit helpers for rendering structures from SMILES."""
 
 from __future__ import annotations
 
 from functools import lru_cache
 from io import BytesIO
 
+from rdkit import Chem
+from rdkit.Chem import Draw
+
 
 def rdkit_available() -> bool:
-    try:
-        import rdkit  # noqa: F401
-
-        return True
-    except Exception:
-        return False
+    return True
 
 
 @lru_cache(maxsize=512)
 def smiles_to_png_bytes(smiles: str, width: int = 320, height: int = 240) -> tuple[bytes | None, str | None]:
-    """Render a SMILES string to PNG bytes when RDKit is installed."""
+    """Render a SMILES string to PNG bytes with RDKit."""
 
     if not smiles or str(smiles).strip().lower() in {"nan", "none", "<na>"}:
         return None, "No SMILES is available for this sample."
-
-    try:
-        from rdkit import Chem
-        from rdkit.Chem import Draw
-    except Exception:
-        return None, "RDKit is not installed. Run: .venv/bin/python -m pip install rdkit"
 
     mol = Chem.MolFromSmiles(str(smiles).strip())
     if mol is None:

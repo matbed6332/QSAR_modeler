@@ -72,6 +72,7 @@ def run_genetic_algorithm_selection(
     cv_folds: int = 5,
     random_seed: int = 42,
     early_stopping_rounds: int = 0,
+    progress_callback: Callable[[dict[str, float | int | bool | str]], None] | None = None,
 ) -> GAResult:
     """Run a compact GA over descriptor bitmasks.
 
@@ -159,17 +160,21 @@ def run_genetic_algorithm_selection(
         else:
             stale_generations += 1
         early_stop = bool(early_stopping_rounds and stale_generations >= early_stopping_rounds)
-        history_rows.append(
-            {
-                "generation": generation,
-                "best_score": generation_best,
-                "mean_score": float(np.mean(finite_scores)) if finite_scores else np.nan,
-                "best_descriptor_count": int(population[best_idx].sum()),
-                "evaluated_subsets": int(len(cache)),
-                "validation_mode": validation_mode,
-                "early_stopped": early_stop,
-            }
-        )
+        history_row = {
+            "generation": generation,
+            "best_score": generation_best,
+            "mean_score": float(np.mean(finite_scores)) if finite_scores else np.nan,
+            "best_descriptor_count": int(population[best_idx].sum()),
+            "evaluated_subsets": int(len(cache)),
+            "validation_mode": validation_mode,
+            "early_stopped": early_stop,
+        }
+        history_rows.append(history_row)
+        if progress_callback is not None:
+            try:
+                progress_callback(dict(history_row))
+            except Exception:
+                pass
         if generation == generations or early_stop:
             break
 
@@ -213,26 +218,29 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
         X = pd.DataFrame(X).copy()
         self.input_descriptors_ = X.columns.astype(str).tolist()
         method = self.method
+        params = dict(self.params)
+        progress_callback = params.pop("progress_callback", None)
+        self.params = params
 
         if method == "None":
             self.selected_descriptors_ = self.input_descriptors_
         elif method == "Manual":
-            requested = [str(col) for col in self.params.get("manual_descriptors", [])]
+            requested = [str(col) for col in params.get("manual_descriptors", [])]
             self.selected_descriptors_ = [col for col in requested if col in X.columns]
             if not self.selected_descriptors_:
                 raise ValueError("Manual feature selection did not include any available descriptors.")
         elif method == "Variance threshold":
-            threshold = float(self.params.get("threshold", 0.0))
+            threshold = float(params.get("threshold", 0.0))
             selector = VarianceThreshold(threshold=threshold)
             selector.fit(X, y)
             self.selected_descriptors_ = X.columns[selector.get_support()].tolist()
         elif method == "SelectKBest":
-            k = min(int(self.params.get("k", min(10, X.shape[1]))), X.shape[1])
+            k = min(int(params.get("k", min(10, X.shape[1]))), X.shape[1])
             selector = SelectKBest(score_func=f_regression, k=k)
             selector.fit(X, y)
             self.selected_descriptors_ = X.columns[selector.get_support()].tolist()
         elif method == "RFE":
-            n_features = min(int(self.params.get("n_features", min(10, X.shape[1]))), X.shape[1])
+            n_features = min(int(params.get("n_features", min(10, X.shape[1]))), X.shape[1])
             selector = RFE(estimator=LinearRegression(), n_features_to_select=n_features)
             selector.fit(X, y)
             self.selected_descriptors_ = X.columns[selector.get_support()].tolist()
@@ -243,17 +251,18 @@ class FeatureSelector(BaseEstimator, TransformerMixin):
                 X,
                 y,
                 estimator_factory=estimator_factory,
-                population_size=int(self.params.get("population_size", 30)),
-                generations=int(self.params.get("generations", 20)),
-                crossover_probability=float(self.params.get("crossover_probability", 0.8)),
-                mutation_probability=float(self.params.get("mutation_probability", 0.05)),
-                tournament_size=int(self.params.get("tournament_size", 3)),
-                min_descriptors=int(self.params.get("min_descriptors", 1)),
-                max_descriptors=int(self.params.get("max_descriptors", X.shape[1])),
-                scoring_metric=self.params.get("scoring_metric", "Q2 / CV R2"),
-                cv_folds=int(self.params.get("cv_folds", 5)),
-                random_seed=int(self.params.get("random_seed", 42)),
-                early_stopping_rounds=int(self.params.get("early_stopping_rounds", 0)),
+                population_size=int(params.get("population_size", 30)),
+                generations=int(params.get("generations", 20)),
+                crossover_probability=float(params.get("crossover_probability", 0.8)),
+                mutation_probability=float(params.get("mutation_probability", 0.05)),
+                tournament_size=int(params.get("tournament_size", 3)),
+                min_descriptors=int(params.get("min_descriptors", 1)),
+                max_descriptors=int(params.get("max_descriptors", X.shape[1])),
+                scoring_metric=params.get("scoring_metric", "Q2 / CV R2"),
+                cv_folds=int(params.get("cv_folds", 5)),
+                random_seed=int(params.get("random_seed", 42)),
+                early_stopping_rounds=int(params.get("early_stopping_rounds", 0)),
+                progress_callback=progress_callback,
             )
             self.selected_descriptors_ = result.selected_descriptors
             self.ga_history_ = result.history

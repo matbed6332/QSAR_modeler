@@ -203,16 +203,30 @@ def pca_explained_variance_plot(estimator):
     return fig
 
 
-def rf_importance_plot(estimator, descriptors: list[str], top_n: int = 20, title: str = "Descriptor importance"):
-    fig, ax = plt.subplots(figsize=(6.5, 4.8))
-    regressor = estimator.named_steps.get("regressor")
-    if not hasattr(regressor, "feature_importances_"):
-        ax.text(0.5, 0.5, "Feature importance is available for tree ensemble models.", ha="center", va="center")
+def descriptor_importance_plot(importance: pd.DataFrame, top_n: int = 20, title: str = "Descriptor importance"):
+    fig, ax = plt.subplots(figsize=(6.8, 4.9))
+    if importance.empty or "descriptor" not in importance.columns:
+        ax.text(0.5, 0.5, "Native descriptor importance is not available for this model.", ha="center", va="center")
+        ax.set_axis_off()
         return fig
-    importances = pd.Series(regressor.feature_importances_, index=descriptors).sort_values(ascending=False).head(top_n)
-    ax.barh(importances.index[::-1], importances.values[::-1], color="#59a14f")
+
+    data = importance.copy()
+    if "abs_importance" not in data.columns:
+        data["abs_importance"] = data.get("importance", 0.0).abs()
+    data = data.sort_values("abs_importance", ascending=False).head(top_n)
+
+    if "coefficient" in data.columns and data["coefficient"].notna().any():
+        values = data["coefficient"].astype(float)
+        colors = np.where(values >= 0, "#4c78a8", "#d62728")
+        ax.barh(data["descriptor"].iloc[::-1], values.iloc[::-1], color=colors[::-1], alpha=0.9)
+        ax.axvline(0, color="#222222", linewidth=1.0)
+        ax.set_xlabel("Coefficient")
+    else:
+        values = data["abs_importance"].astype(float)
+        ax.barh(data["descriptor"].iloc[::-1], values.iloc[::-1], color="#59a14f", alpha=0.9)
+        ax.set_xlabel("Importance")
+
     ax.set_title(title)
-    ax.set_xlabel("Importance")
     fig.tight_layout()
     return fig
 

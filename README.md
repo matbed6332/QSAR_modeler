@@ -9,7 +9,7 @@ A Streamlit application for building, validating, saving, loading, and visualizi
 - Optional SMILES column selection for structure lookup and hover context in PCA/Williams plots
 - Automatic removal of endpoint leakage columns and common report/model artifact columns accidentally present in descriptor sheets
 - Dataset preview, missing-value diagnostics, endpoint statistics, and descriptor statistics
-- Exploratory PCA screening before modeling with eigenvalues, explained variance, selectable PC axes, hoverable sample IDs, endpoint statistical screening, and outlier exclusion history
+- Exploratory PCA screening after preprocessing, with transformed endpoint values, eigenvalues, explained variance, selectable PC axes, clickable sample IDs, endpoint statistical screening, and outlier exclusion history
 - Leakage-aware preprocessing fitted on the training set only
 - Endpoint transformations: none, `log10(y)`, and `-log10(y)`
 - Random split with optional binned-y stratification
@@ -43,7 +43,6 @@ modules/
   splitting.py
   statistical_tests.py
 requirements.txt
-requirements-rdkit.txt
 tests/
   smoke_test.py
 ```
@@ -80,13 +79,7 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-Optional structure rendering from SMILES uses RDKit:
-
-```bash
-.venv/bin/python -m pip install -r requirements-rdkit.txt
-```
-
-Without RDKit the app still works and shows SMILES text, but molecule images are not rendered.
+RDKit is a required dependency and is installed from `requirements.txt`. SMILES structure rendering is treated as a core part of the application.
 
 ## Data Format
 
@@ -96,7 +89,7 @@ If compounds have IDs, place them in the first column of both sheets and enable 
 
 ## Scientific Notes
 
-Preprocessing that depends on descriptor distributions is fitted only on `X_train` and then applied to `X_test` and future prediction data. Scaling is part of the sklearn model pipeline, so cross-validation refits the scaler inside each fold. The test set remains external to model fitting and descriptor-selection fitting. Excel loading and exploratory PCA screening are cached by Streamlit to reduce avoidable recalculation during UI interaction.
+Preprocessing that depends on descriptor distributions is fitted only on `X_train` and then applied to `X_test` and future prediction data during modeling. Exploratory PCA screening is shown after the preprocessing controls and uses the current preprocessing settings plus the current endpoint transformation, so transformed values such as `log10(y)` can be inspected before modeling. Scaling is part of the sklearn model pipeline, so cross-validation refits the scaler inside each fold. The test set remains external to model fitting and descriptor-selection fitting. Excel loading and exploratory PCA screening are cached by Streamlit to reduce avoidable recalculation during UI interaction.
 
 GA descriptor selection can use internal cross-validation fitness or a faster training-score-only mode. Training-score GA is useful for expensive searches, but model choice should still be based on the final training/CV/external-test statistics.
 

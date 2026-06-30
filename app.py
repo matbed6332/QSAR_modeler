@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import replace
 from datetime import datetime
 from io import BytesIO
@@ -13,17 +14,19 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from modules.applicability_domain import distance_domain_results, pca_domain_scores, williams_results
-from modules.chemistry import rdkit_available, smiles_to_png_bytes
+from modules.chemistry import smiles_to_png_bytes
 from modules.data_loader import clean_sheet, dataset_summary, endpoint_transform_preview, prepare_xy, read_excel_sheets
 from modules.evaluation import evaluate_fitted_model, rank_models, results_table
 from modules.export import dataframe_to_csv_bytes, dataframes_to_excel_bytes, figures_to_zip_bytes, list_to_frame, safe_file_stem
 from modules.feature_selection import FeatureSelector
+from modules.interpretation import descriptor_importance_frame, mlr_equation
 from modules.model_io import ModelBundle, ModelRunBundle, bundle_from_bytes, bundle_to_bytes, predict_with_bundle, predict_with_run_bundle
 from modules.models import MODEL_NAMES, build_pipeline, estimator_parameters
 from modules.pca_screening import compute_pca_screening
 from modules.plots import (
     correlation_heatmap,
     cv_score_plot,
+    descriptor_importance_plot,
     distance_domain_plot,
     endpoint_histogram,
     fig_to_bytes,
@@ -34,7 +37,6 @@ from modules.plots import (
     pca_score_plot,
     residual_histogram,
     residual_plot,
-    rf_importance_plot,
     williams_plot,
 )
 from modules.preprocessing import (
@@ -173,6 +175,38 @@ def display_messages(messages: list[str], level: str = "warning") -> None:
             st.warning(message)
 
 
+def format_duration(seconds: float | None) -> str:
+    if seconds is None or not np.isfinite(seconds):
+        return "estimating"
+    seconds = max(0, int(round(float(seconds))))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def training_progress_text(
+    action: str,
+    completed_units: float,
+    total_units: int,
+    start_time: float,
+    detail: str | None = None,
+) -> str:
+    total_units = max(1, int(total_units))
+    completed_units = max(0.0, min(float(completed_units), float(total_units)))
+    elapsed = time.perf_counter() - start_time
+    fraction = completed_units / total_units
+    eta = (elapsed / fraction) - elapsed if fraction > 0 else None
+    percent = int(round(fraction * 100))
+    parts = [f"{action} ({percent}%)", f"elapsed {format_duration(elapsed)}", f"ETA {format_duration(eta)}"]
+    if detail:
+        parts.append(detail)
+    return " | ".join(parts)
+
+
 def sync_widget(source_key: str, target_key: str) -> None:
     st.session_state[target_key] = st.session_state[source_key]
 
@@ -305,8 +339,18 @@ def render_structure_panel(
         return
 
     ids = smiles_clean.index.astype(str).tolist()
-    default_index = ids.index(selected_sample_id) if selected_sample_id in ids else 0
-    selected_id = st.selectbox("Show structure for sample ID", ids, index=default_index, key=f"{key}_structure_id")
+    widget_key = f"{key}_structure_id"
+    plot_key = f"{key}_last_plot_structure_id"
+    if selected_sample_id in ids and selected_sample_id != st.session_state.get(plot_key):
+        st.session_state[widget_key] = selected_sample_id
+        st.session_state[plot_key] = selected_sample_id
+        st.caption(f"Selected from plot: {selected_sample_id}")
+    elif selected_sample_id in ids:
+        st.caption(f"Last plot selection: {selected_sample_id}")
+    else:
+        st.session_state[plot_key] = None
+    default_index = ids.index(st.session_state[widget_key]) if st.session_state.get(widget_key) in ids else 0
+    selected_id = st.selectbox("Show structure for sample ID", ids, index=default_index, key=widget_key)
     smiles = str(smiles_clean.loc[smiles_clean.index.astype(str) == selected_id].iloc[0])
     st.code(smiles, language="text")
     image_bytes, error = smiles_to_png_bytes(smiles)
@@ -314,8 +358,6 @@ def render_structure_panel(
         st.image(image_bytes, caption=f"Structure for {selected_id}", use_container_width=False)
     else:
         st.warning(error or "Structure rendering failed.")
-        if not rdkit_available():
-            st.caption("Install RDKit locally with: .venv/bin/python -m pip install rdkit")
 
 
 def mapping_missing_strategy(label: str) -> tuple[str, bool]:
@@ -327,6 +369,33 @@ def mapping_missing_strategy(label: str) -> tuple[str, bool]:
         "Require complete descriptor matrix": ("none", False),
     }
     return mapping[label]
+
+
+def endpoint_label(endpoint_name: str, method: str) -> str:
+    if method == "log10":
+        return f"log10({endpoint_name})"
+    if method == "negative_log10":
+        return f"-log10({endpoint_name})"
+    return endpoint_name
+
+
+def prepared_pca_inputs(dataset) -> tuple[pd.DataFrame, pd.Series, str, DescriptorPreprocessor, list[str]]:
+    """Apply current preprocessing settings for exploratory PCA screening."""
+
+    endpoint_method = st.session_state.get("endpoint_method", "none")
+    transformed_y = EndpointTransformer(endpoint_method).transform(dataset.y)
+    transformed_y.name = endpoint_label(dataset.endpoint_name, endpoint_method)
+
+    config = st.session_state.get("preprocessing_config", PreprocessingConfig())
+    notes: list[str] = []
+    pca_config = config
+    if st.session_state.get("drop_rows_after_split", False) and config.missing_strategy == "none":
+        pca_config = replace(config, missing_strategy="median_impute")
+        notes.append("PCA screening used median imputation because row removal is only applied after train/test split.")
+
+    preprocessor = DescriptorPreprocessor(pca_config)
+    X_preprocessed = preprocessor.fit_transform(dataset.X, transformed_y)
+    return X_preprocessed, transformed_y, transformed_y.name, preprocessor, notes
 
 
 def safe_component_count(model_name: str, params: dict[str, Any], n_features: int, n_train: int, cv_folds: int) -> dict[str, Any]:
@@ -378,6 +447,13 @@ def apply_interactive_plot_style(fig):
             "font": {"color": "#000000"},
         },
         legend={"font": {"color": "#000000"}},
+        coloraxis={
+            "colorbar": {
+                "tickfont": {"color": "#000000"},
+                "title": {"font": {"color": "#000000"}},
+                "tickcolor": "#000000",
+            }
+        },
     )
     fig.update_xaxes(
         showline=True,
@@ -404,7 +480,7 @@ def apply_interactive_plot_style(fig):
     return fig
 
 
-def pca_score_figure(scores: pd.DataFrame, pc_x: str, pc_y: str):
+def pca_score_figure(scores: pd.DataFrame, pc_x: str, pc_y: str, endpoint_label: str = "Endpoint"):
     custom_data = ["sample_id"]
     has_smiles = "smiles" in scores.columns
     if has_smiles:
@@ -419,13 +495,14 @@ def pca_score_figure(scores: pd.DataFrame, pc_x: str, pc_y: str):
         custom_data=custom_data,
         color_continuous_scale="Viridis",
         template="plotly_white",
+        title="PCA score plot",
         height=560,
     )
     hovertemplate = (
         "<b>%{customdata[0]}</b><br>"
         + f"{pc_x}: %{{x:.4f}}<br>"
         + f"{pc_y}: %{{y:.4f}}<br>"
-        + "Endpoint: %{marker.color:.5g}"
+        + f"{endpoint_label}: %{{marker.color:.5g}}"
     )
     if has_smiles:
         hovertemplate += "<br>SMILES: %{customdata[1]}"
@@ -435,8 +512,12 @@ def pca_score_figure(scores: pd.DataFrame, pc_x: str, pc_y: str):
         hovertemplate=hovertemplate,
     )
     fig.update_layout(
-        margin={"l": 20, "r": 20, "t": 28, "b": 20},
-        coloraxis_colorbar={"title": "Endpoint"},
+        margin={"l": 20, "r": 20, "t": 56, "b": 20},
+        coloraxis_colorbar={
+            "title": {"text": endpoint_label, "font": {"color": "#000000"}},
+            "tickfont": {"color": "#000000"},
+            "tickcolor": "#000000",
+        },
     )
     return apply_interactive_plot_style(fig)
 
@@ -574,6 +655,33 @@ def interactive_williams_plot(ad_results: pd.DataFrame):
     return apply_interactive_plot_style(fig)
 
 
+def payload_descriptor_importance(payload: dict[str, Any]) -> pd.DataFrame:
+    importance = payload.get("descriptor_importance")
+    if isinstance(importance, pd.DataFrame) and not importance.empty:
+        return importance.copy()
+    try:
+        return descriptor_importance_frame(
+            payload["estimator"],
+            payload.get("selected_descriptors", []),
+            payload.get("model_name", ""),
+        )
+    except Exception:
+        return pd.DataFrame()
+
+
+def payload_mlr_equation(payload: dict[str, Any]) -> tuple[str, pd.DataFrame]:
+    equation = payload.get("model_equation", "")
+    terms = payload.get("equation_terms", pd.DataFrame())
+    if equation:
+        return str(equation), terms if isinstance(terms, pd.DataFrame) else pd.DataFrame()
+    if payload.get("model_name") != "MLR / Linear Regression":
+        return "", pd.DataFrame()
+    try:
+        return mlr_equation(payload["estimator"], payload.get("selected_descriptors", []))
+    except Exception:
+        return "", pd.DataFrame()
+
+
 def create_figures_for_result(label: str, payload: dict[str, Any]) -> dict[str, object]:
     evaluation = payload["evaluation"]
     figures = {
@@ -592,12 +700,11 @@ def create_figures_for_result(label: str, payload: dict[str, Any]) -> dict[str, 
         figures["Applicability Domain - PCA plot"] = pca_score_plot(payload["pca_ad"])
     if payload["feature_selector"].method == "Genetic Algorithm" and not payload["feature_selector"].ga_history_.empty:
         figures["GA progress"] = ga_progress_plot(payload["feature_selector"].ga_history_)
-    if payload["model_name"] in FEATURE_IMPORTANCE_MODELS:
-        model_short = payload["model_name"].split(" / ")[0]
-        figures[f"{model_short} descriptor importance"] = rf_importance_plot(
-            payload["estimator"],
-            payload["selected_descriptors"],
-            title=f"{model_short} descriptor importance",
+    importance = payload_descriptor_importance(payload)
+    if not importance.empty:
+        figures["Descriptor importance"] = descriptor_importance_plot(
+            importance,
+            title=f"{label}: descriptor importance",
         )
     if payload["model_name"] == "PCR / Principal Component Regression":
         figures["PCR explained variance"] = pca_explained_variance_plot(payload["estimator"])
@@ -626,11 +733,18 @@ def build_report_sheets(label: str, payload: dict[str, Any], all_results: pd.Dat
         [{"parameter": key, "value": json.dumps(value) if isinstance(value, (dict, list)) else value} for key, value in payload["parameters"].items()]
     )
     warnings_frame = pd.DataFrame({"warning": payload.get("warnings", [])})
+    importance_frame = payload_descriptor_importance(payload).reset_index(drop=True)
+    equation, equation_terms = payload_mlr_equation(payload)
+    equation_frame = pd.DataFrame({"model_equation": [equation]}) if equation else pd.DataFrame(columns=["model_equation"])
+    if isinstance(equation_terms, pd.DataFrame) and not equation_terms.empty:
+        equation_frame = pd.concat([equation_frame, equation_terms.reset_index(drop=True)], axis=1)
     return {
         "Summary": all_results,
         "Preprocessing": payload["preprocessor"].get_report().to_frame(),
         "Removed descriptors": removed_descriptors_frame(payload["preprocessor"]),
         "Selected descriptors": list_to_frame(payload["selected_descriptors"]),
+        "Descriptor importance": importance_frame,
+        "Model equation": equation_frame,
         "Train predictions": evaluation.train_predictions.reset_index(drop=True),
         "Test predictions": evaluation.test_predictions.reset_index(drop=True),
         "Model statistics": pd.DataFrame([evaluation.metrics]),
@@ -943,7 +1057,10 @@ def run_training_workflow(
         keep_top_n = max(1, len(selected_models))
     split_seed = int(split_config["random_state"])
     total_jobs = max(1, selector_candidates * len(selected_models))
-    progress = st.progress(0, text="Starting model training")
+    start_time = time.perf_counter()
+    progress = st.progress(0, text=training_progress_text("Starting model training", 0, total_jobs, start_time))
+    runtime_status = st.empty()
+    runtime_status.caption(training_progress_text("Starting model training", 0, total_jobs, start_time))
     results: dict[str, dict[str, Any]] = {}
     warnings: list[str] = []
     if feature_selection["method"] == "Genetic Algorithm" and int(feature_selection.get("params", {}).get("cv_folds", 5)) < 2:
@@ -995,11 +1112,15 @@ def run_training_workflow(
         selector_seed = base_selector_seed + candidate_index - 1
         for model_name in selected_models:
             job_counter += 1
-            percent = int(round((job_counter - 1) / total_jobs * 100))
-            progress.progress(
-                (job_counter - 1) / total_jobs,
-                text=f"Training {job_counter}/{total_jobs} models ({percent}%)",
+            job_start_units = job_counter - 1
+            start_text = training_progress_text(
+                f"Training {job_counter}/{total_jobs} models",
+                job_start_units,
+                total_jobs,
+                start_time,
             )
+            progress.progress(job_start_units / total_jobs, text=start_text)
+            runtime_status.caption(start_text)
 
             raw_params = dict(model_params.get(model_name, {}))
             if model_name in FEATURE_IMPORTANCE_MODELS:
@@ -1009,10 +1130,35 @@ def run_training_workflow(
             selector_params = dict(feature_selection["params"])
             if feature_selection["method"] == "Genetic Algorithm":
                 selector_params["random_seed"] = selector_seed
-            selector_config = dict(feature_selection)
-            selector_config["params"] = selector_params
+                ga_generations = int(selector_params.get("generations", 0))
 
-            selector = FeatureSelector(method=selector_config["method"], params=selector_config["params"])
+                def ga_progress_callback(history_row, current_job=job_counter, generations=ga_generations):
+                    generation = int(history_row.get("generation", 0))
+                    total_generation_steps = max(1, generations + 1)
+                    generation_units = min((generation + 1) / total_generation_steps, 0.98)
+                    completed_units = (current_job - 1) + generation_units
+                    best_score = history_row.get("best_score", np.nan)
+                    best_score_text = f"{float(best_score):.4g}" if np.isfinite(best_score) else "n/a"
+                    detail = (
+                        f"GA generation {generation}/{generations}; "
+                        f"evaluated subsets {int(history_row.get('evaluated_subsets', 0))}; "
+                        f"best score {best_score_text}"
+                    )
+                    text = training_progress_text(
+                        f"Training {current_job}/{total_jobs} models",
+                        completed_units,
+                        total_jobs,
+                        start_time,
+                        detail,
+                    )
+                    progress.progress(min(completed_units / total_jobs, 0.999), text=text)
+                    runtime_status.caption(text)
+
+                selector_params["progress_callback"] = ga_progress_callback
+            selector_config = dict(feature_selection)
+            selector_config["params"] = {key: value for key, value in selector_params.items() if key != "progress_callback"}
+
+            selector = FeatureSelector(method=selector_config["method"], params=selector_params)
             X_train_selected = selector.fit_transform(X_train_preprocessed, y_train, estimator_factory=estimator_factory)
             X_test_selected = selector.transform(X_test_preprocessed)
 
@@ -1036,6 +1182,11 @@ def run_training_workflow(
             w_ad = williams_results(X_train_selected, X_test_selected, evaluation.train_predictions, evaluation.test_predictions)
             d_ad = distance_domain_results(X_train_selected, X_test_selected)
             pca_ad = pca_domain_scores(X_train_selected, X_test_selected)
+            descriptor_importance = descriptor_importance_frame(estimator, selector.selected_descriptors_, model_name)
+            model_equation = ""
+            equation_terms = pd.DataFrame()
+            if model_name == "MLR / Linear Regression":
+                model_equation, equation_terms = mlr_equation(estimator, selector.selected_descriptors_)
             if smiles_lookup:
                 for frame in [w_ad, d_ad, pca_ad]:
                     if not frame.empty and "sample_id" in frame.columns:
@@ -1057,6 +1208,8 @@ def run_training_workflow(
             parameters["cv_folds"] = cv_folds
             parameters["cv_repeats"] = cv_repeats
             parameters["excluded_samples"] = excluded_samples.to_dict("records") if excluded_samples is not None else []
+            if model_equation:
+                parameters["model_equation"] = model_equation
 
             bundle = ModelBundle(
                 model_label=model_label,
@@ -1071,6 +1224,7 @@ def run_training_workflow(
                     "endpoint_name": dataset.endpoint_name,
                     "ranking_metric": ranking_metric,
                     "parameters": parameters,
+                    "model_equation": model_equation,
                     "excluded_samples": excluded_samples.to_dict("records") if excluded_samples is not None else [],
                 },
                 train_reference_X=X_train_selected,
@@ -1090,6 +1244,9 @@ def run_training_workflow(
                 "distance_ad": d_ad,
                 "pca_ad": pca_ad,
                 "parameters": parameters,
+                "descriptor_importance": descriptor_importance,
+                "model_equation": model_equation,
+                "equation_terms": equation_terms,
                 "warnings": evaluation.warnings.copy(),
                 "bundle": bundle,
                 "split_membership": split.membership,
@@ -1105,10 +1262,14 @@ def run_training_workflow(
                 payload["warnings"].append("One or more test compounds are outside the Williams-plot applicability domain.")
             results[model_label] = payload
 
-            progress.progress(
-                job_counter / total_jobs,
-                text=f"Training {job_counter}/{total_jobs} models ({int(round(job_counter / total_jobs * 100))}%)",
+            done_text = training_progress_text(
+                f"Training {job_counter}/{total_jobs} models",
+                job_counter,
+                total_jobs,
+                start_time,
             )
+            progress.progress(job_counter / total_jobs, text=done_text)
+            runtime_status.caption(done_text)
 
     table = results_table(
         {
@@ -1126,7 +1287,9 @@ def run_training_workflow(
     ranked = rank_models(table, ranking_metric).head(keep_top_n).reset_index(drop=True)
     kept_labels = ranked["Model label"].tolist() if not ranked.empty else []
     results = {label: results[label] for label in kept_labels}
-    progress.progress(1.0, text=f"Model training complete. Kept top {len(results)} of {total_jobs} models.")
+    elapsed_text = format_duration(time.perf_counter() - start_time)
+    progress.progress(1.0, text=f"Model training complete in {elapsed_text}. Kept top {len(results)} of {total_jobs} models.")
+    runtime_status.success(f"Training finished in {elapsed_text}. Kept top {len(results)} of {total_jobs} models.")
     return results, ranked, warnings
 
 
@@ -1284,8 +1447,8 @@ st.markdown(
 tabs = st.tabs(
     [
         "1. Data upload",
-        "2. PCA screening",
-        "3. Preprocessing",
+        "2. Preprocessing",
+        "3. PCA screening",
         "4. Train/test split",
         "5. Model configuration",
         "6. Feature selection",
@@ -1409,11 +1572,222 @@ with tabs[0]:
             metric_panel("SMILES", smiles_count)
         display_messages(dataset.warnings)
         if st.session_state.excluded_sample_ids:
-            st.info(f"{len(st.session_state.excluded_sample_ids)} sample(s) are excluded from modeling after PCA screening.")
+            st.info(f"{len(st.session_state.excluded_sample_ids)} sample(s) are excluded from modeling after screening.")
         with st.expander("Initial descriptor statistics", expanded=False):
             st.dataframe(summary["descriptor_stats"].head(100), use_container_width=True)
 
 with tabs[1]:
+    st.subheader("Preprocessing")
+    if show_dataset_gate():
+        dataset = active_dataset()
+        summary = dataset_summary(dataset.X, dataset.y)
+        c1, c2, c3, c4 = st.columns(4)
+        with c1:
+            metric_panel("Missing rows", summary["missing_rows"])
+        with c2:
+            metric_panel("Missing columns", summary["missing_columns"])
+        with c3:
+            metric_panel("Endpoint min", f"{dataset.y.min():.4g}")
+        with c4:
+            metric_panel("Endpoint max", f"{dataset.y.max():.4g}")
+
+        left, right = st.columns([0.9, 1.1])
+        with left:
+            endpoint_method = st.selectbox(
+                "Endpoint transformation",
+                ["none", "log10", "negative_log10"],
+                format_func=lambda value: {"none": "No transformation", "log10": "log10(y)", "negative_log10": "-log10(y)"}[value],
+                key="endpoint_method",
+            )
+            histogram_bins = st.slider("Endpoint histogram bins", 5, 80, 24, key="histogram_bins")
+            missing_label = st.selectbox(
+                "Missing descriptor handling",
+                [
+                    "Median imputation",
+                    "Mean imputation",
+                    "Remove descriptor columns with missing values",
+                    "Remove rows with missing descriptors after split",
+                    "Require complete descriptor matrix",
+                ],
+                key="missing_label",
+            )
+            missing_strategy, drop_rows_flag = mapping_missing_strategy(missing_label)
+            remove_constant = st.checkbox("Remove constant descriptors", value=True, key="remove_constant")
+            remove_low_variance = st.checkbox("Remove low-variance descriptors", value=True, key="remove_low_variance")
+            variance_threshold = st.number_input(
+                "Low-variance threshold",
+                min_value=0.0,
+                value=0.0,
+                step=0.0001,
+                format="%.6f",
+                key="variance_threshold",
+            )
+            remove_high_corr = st.checkbox("Remove highly correlated descriptors", value=True, key="remove_high_corr")
+            corr_threshold = st.slider("Absolute correlation threshold", 0.50, 0.999, 0.90, 0.01, key="corr_threshold")
+
+        preview_config = PreprocessingConfig(
+            missing_strategy=missing_strategy,
+            remove_constant=remove_constant,
+            remove_low_variance=remove_low_variance,
+            variance_threshold=variance_threshold,
+            remove_high_correlation=remove_high_corr,
+            correlation_threshold=corr_threshold,
+        )
+        st.session_state.preprocessing_config = preview_config
+        st.session_state.drop_rows_after_split = drop_rows_flag
+
+        with right:
+            transformed_y, transform_warnings = endpoint_transform_preview(dataset.y, endpoint_method)
+            transformed_y.name = endpoint_label(dataset.endpoint_name, endpoint_method)
+            display_messages(transform_warnings)
+            hist_cols = st.columns(2)
+            with hist_cols[0]:
+                st.pyplot(endpoint_histogram(dataset.y, bins=histogram_bins, title="Endpoint before transformation"))
+            with hist_cols[1]:
+                st.pyplot(endpoint_histogram(transformed_y, bins=histogram_bins, title="Endpoint after transformation"))
+            stats_frame = pd.DataFrame(
+                {
+                    "Before": dataset.y.describe(),
+                    "After": transformed_y.describe(),
+                }
+            )
+            st.dataframe(stats_frame, use_container_width=True)
+
+        with st.expander("Endpoint statistical screening", expanded=False):
+            st.caption(
+                "Exploratory preprocessing check: descriptors are compared between endpoint-defined groups, "
+                "and endpoint outliers are flagged with z-score/IQR rules. These tests do not select descriptors automatically."
+            )
+            stat_cols = st.columns(5)
+            with stat_cols[0]:
+                grouping_method = st.selectbox(
+                    "Endpoint groups",
+                    ["Lower vs upper quartile", "Median split"],
+                    key="endpoint_grouping_method",
+                )
+            with stat_cols[1]:
+                statistical_test = st.selectbox(
+                    "Statistical test",
+                    ["Welch t-test", "Student t-test", "Mann-Whitney U"],
+                    key="endpoint_statistical_test",
+                )
+            with stat_cols[2]:
+                z_threshold = st.number_input(
+                    "Endpoint z threshold",
+                    min_value=1.0,
+                    max_value=10.0,
+                    value=3.0,
+                    step=0.25,
+                    key="endpoint_z_threshold",
+                )
+            with stat_cols[3]:
+                iqr_multiplier = st.number_input(
+                    "IQR multiplier",
+                    min_value=0.5,
+                    max_value=5.0,
+                    value=1.5,
+                    step=0.25,
+                    key="endpoint_iqr_multiplier",
+                )
+            with stat_cols[4]:
+                descriptor_rows = st.number_input(
+                    "Descriptor rows shown",
+                    min_value=5,
+                    max_value=1000,
+                    value=50,
+                    step=5,
+                    key="endpoint_stat_descriptor_rows",
+                )
+
+            screening_config = preview_config
+            if drop_rows_flag and preview_config.missing_strategy == "none":
+                screening_config = replace(preview_config, missing_strategy="median_impute")
+                st.info("This exploratory screening uses median imputation because row removal is applied only after train/test split.")
+            st.caption(
+                "For modeling, preprocessing is still fitted only on the training set after the split. "
+                "This table is a data-review preview for the currently active dataset."
+            )
+            try:
+                screening_preprocessor = DescriptorPreprocessor(screening_config)
+                X_screening = screening_preprocessor.fit_transform(dataset.X, transformed_y)
+                descriptor_columns = X_screening.columns.astype(str).tolist()
+                stat_table, endpoint_grouping = compare_endpoint_groups(
+                    X_screening,
+                    transformed_y,
+                    descriptor_columns,
+                    grouping_method=grouping_method,
+                    test_name=statistical_test,
+                )
+                if not stat_table.empty:
+                    stat_table["abs_effect_size"] = stat_table["effect_size_cohens_d"].abs()
+                    stat_table = stat_table.sort_values(
+                        ["p_value", "abs_effect_size"],
+                        ascending=[True, False],
+                        na_position="last",
+                    )
+                st.caption(endpoint_grouping.description)
+                st.dataframe(
+                    stat_table.head(int(descriptor_rows)).style.format(
+                        {
+                            "low_mean": "{:.5g}",
+                            "high_mean": "{:.5g}",
+                            "mean_difference_high_minus_low": "{:.5g}",
+                            "effect_size_cohens_d": "{:.4f}",
+                            "abs_effect_size": "{:.4f}",
+                            "statistic": "{:.4g}",
+                            "p_value": "{:.4g}",
+                        }
+                    ),
+                    use_container_width=True,
+                )
+                if len(stat_table) > int(descriptor_rows):
+                    st.caption(f"Showing top {int(descriptor_rows)} of {len(stat_table)} descriptors sorted by p-value and effect size.")
+            except Exception as exc:
+                st.warning(f"Endpoint group descriptor comparison could not be calculated: {exc}")
+
+            endpoint_flags = endpoint_outlier_table(
+                transformed_y,
+                z_threshold=z_threshold,
+                iqr_multiplier=iqr_multiplier,
+            )
+            flagged_endpoint_ids = endpoint_flags.loc[endpoint_flags["flagged"], "sample_id"].astype(str).tolist()
+            st.caption("Endpoint outlier flags")
+            st.dataframe(
+                endpoint_flags.style.format(
+                    {
+                        "endpoint": "{:.5g}",
+                        "z_score": "{:.4f}",
+                        "iqr_lower_fence": "{:.5g}",
+                        "iqr_upper_fence": "{:.5g}",
+                    }
+                ),
+                use_container_width=True,
+            )
+            if flagged_endpoint_ids:
+                st.warning(f"Endpoint statistical screening flagged {len(flagged_endpoint_ids)} sample(s). Review before excluding.")
+                if st.button("Exclude endpoint-flagged samples", key="exclude_endpoint_flags"):
+                    existing = {str(sample_id) for sample_id in st.session_state.excluded_sample_ids}
+                    new_ids = [sample_id for sample_id in flagged_endpoint_ids if sample_id not in existing]
+                    if new_ids:
+                        st.session_state.excluded_sample_ids = sorted(existing.union(new_ids))
+                        new_log = pd.DataFrame(
+                            {
+                                "sample_id": new_ids,
+                                "reason": "Endpoint statistical screening",
+                                "removed_at": datetime.now().isoformat(timespec="seconds"),
+                                "source": "Preprocessing endpoint statistics",
+                            }
+                        )
+                        st.session_state.outlier_log = pd.concat(
+                            [st.session_state.outlier_log, new_log],
+                            ignore_index=True,
+                        )
+                        reset_modeling_outputs()
+                        st.rerun()
+            else:
+                st.success("No endpoint outliers were flagged by the selected z-score/IQR rules.")
+
+with tabs[2]:
     st.subheader("PCA screening")
     if show_dataset_gate():
         dataset = active_dataset()
@@ -1435,16 +1809,33 @@ with tabs[1]:
         with p4:
             metric_panel("Endpoint", raw_dataset.endpoint_name)
 
+        try:
+            pca_X, pca_y, pca_endpoint_label, pca_preprocessor, pca_notes = prepared_pca_inputs(dataset)
+        except Exception as exc:
+            st.error(f"PCA preprocessing failed: {exc}")
+            pca_X = pd.DataFrame()
+            pca_y = pd.Series(dtype=float)
+            pca_endpoint_label = raw_dataset.endpoint_name
+            pca_preprocessor = None
+            pca_notes = []
+
+        if not pca_X.empty:
+            p_metric_1, p_metric_2 = st.columns(2)
+            with p_metric_1:
+                metric_panel("PCA descriptors", pca_X.shape[1])
+            with p_metric_2:
+                metric_panel("Endpoint scale", pca_endpoint_label)
+
         if dataset.X.shape[0] < 3:
             st.warning("PCA screening requires at least 3 active samples.")
-        elif dataset.X.shape[1] < 2:
-            st.warning("PCA screening requires at least 2 numeric descriptors.")
+        elif pca_X.shape[1] < 2:
+            st.warning("PCA screening requires at least 2 descriptors after current preprocessing settings.")
         else:
-            max_pcs = min(dataset.X.shape[0], dataset.X.shape[1], 100)
+            max_pcs = min(pca_X.shape[0], pca_X.shape[1], 100)
             n_pcs = synced_int_control("PCA components", 2, max(2, max_pcs), min(5, max_pcs), 1, "pca_components")
             scale_pca = st.checkbox("Standardize descriptors before PCA", value=True, key="scale_pca")
             try:
-                pca_result = cached_pca_screening(dataset.X, dataset.y, n_components=n_pcs, scale=scale_pca)
+                pca_result = cached_pca_screening(pca_X, pca_y, n_components=n_pcs, scale=scale_pca)
                 if dataset.smiles is not None:
                     pca_result.scores["smiles"] = dataset.smiles.reindex(pca_result.scores.index).astype("string").fillna("")
                 variance = pca_result.variance.copy()
@@ -1457,7 +1848,7 @@ with tabs[1]:
                     pc_y = st.selectbox("Y axis PC", score_cols, index=default_y_index, key="pca_pc_y")
 
                 pca_event = st.plotly_chart(
-                    pca_score_figure(pca_result.scores, pc_x, pc_y),
+                    pca_score_figure(pca_result.scores, pc_x, pc_y, endpoint_label=pca_endpoint_label),
                     use_container_width=True,
                     key="pca_screening_plot",
                     on_select="rerun",
@@ -1490,110 +1881,13 @@ with tabs[1]:
                     st.dataframe(pca_result.scores, use_container_width=True, height=305)
 
                 with st.expander("PCA preprocessing summary", expanded=False):
+                    if pca_notes:
+                        display_messages(pca_notes, level="info")
+                    if pca_preprocessor is not None:
+                        st.caption("Current preprocessing applied before PCA")
+                        st.dataframe(pca_preprocessor.get_report().to_frame(), use_container_width=True)
+                    st.caption("PCA internal safety preprocessing")
                     st.dataframe(pca_result.preprocessing, use_container_width=True)
-
-                with st.expander("Endpoint statistical screening", expanded=False):
-                    st.caption(
-                        "Exploratory tests compare PCA-score distributions between endpoint-defined groups. "
-                        "Use this as a signal for review, not as automatic proof that a compound should be removed."
-                    )
-                    stat_cols = st.columns(4)
-                    with stat_cols[0]:
-                        grouping_method = st.selectbox(
-                            "Endpoint groups",
-                            ["Lower vs upper quartile", "Median split"],
-                            key="endpoint_grouping_method",
-                        )
-                    with stat_cols[1]:
-                        statistical_test = st.selectbox(
-                            "Statistical test",
-                            ["Welch t-test", "Student t-test", "Mann-Whitney U"],
-                            key="endpoint_statistical_test",
-                        )
-                    with stat_cols[2]:
-                        z_threshold = st.number_input(
-                            "Endpoint z threshold",
-                            min_value=1.0,
-                            max_value=10.0,
-                            value=3.0,
-                            step=0.25,
-                            key="endpoint_z_threshold",
-                        )
-                    with stat_cols[3]:
-                        iqr_multiplier = st.number_input(
-                            "IQR multiplier",
-                            min_value=0.5,
-                            max_value=5.0,
-                            value=1.5,
-                            step=0.25,
-                            key="endpoint_iqr_multiplier",
-                        )
-                    try:
-                        stat_table, endpoint_grouping = compare_endpoint_groups(
-                            pca_result.scores,
-                            dataset.y,
-                            score_cols,
-                            grouping_method=grouping_method,
-                            test_name=statistical_test,
-                        )
-                        st.caption(endpoint_grouping.description)
-                        st.dataframe(
-                            stat_table.style.format(
-                                {
-                                    "low_mean": "{:.5g}",
-                                    "high_mean": "{:.5g}",
-                                    "mean_difference_high_minus_low": "{:.5g}",
-                                    "effect_size_cohens_d": "{:.4f}",
-                                    "statistic": "{:.4g}",
-                                    "p_value": "{:.4g}",
-                                }
-                            ),
-                            use_container_width=True,
-                        )
-                    except Exception as exc:
-                        st.warning(f"Endpoint group comparison could not be calculated: {exc}")
-
-                    endpoint_flags = endpoint_outlier_table(
-                        dataset.y,
-                        z_threshold=z_threshold,
-                        iqr_multiplier=iqr_multiplier,
-                    )
-                    flagged_endpoint_ids = endpoint_flags.loc[endpoint_flags["flagged"], "sample_id"].astype(str).tolist()
-                    st.caption("Endpoint outlier flags")
-                    st.dataframe(
-                        endpoint_flags.style.format(
-                            {
-                                "endpoint": "{:.5g}",
-                                "z_score": "{:.4f}",
-                                "iqr_lower_fence": "{:.5g}",
-                                "iqr_upper_fence": "{:.5g}",
-                            }
-                        ),
-                        use_container_width=True,
-                    )
-                    if flagged_endpoint_ids:
-                        st.warning(f"Endpoint statistical screening flagged {len(flagged_endpoint_ids)} sample(s). Review before excluding.")
-                        if st.button("Exclude endpoint-flagged samples", key="exclude_endpoint_flags"):
-                            existing = {str(sample_id) for sample_id in st.session_state.excluded_sample_ids}
-                            new_ids = [sample_id for sample_id in flagged_endpoint_ids if sample_id not in existing]
-                            if new_ids:
-                                st.session_state.excluded_sample_ids = sorted(existing.union(new_ids))
-                                new_log = pd.DataFrame(
-                                    {
-                                        "sample_id": new_ids,
-                                        "reason": "Endpoint statistical screening",
-                                        "removed_at": datetime.now().isoformat(timespec="seconds"),
-                                        "source": "PCA endpoint statistics",
-                                    }
-                                )
-                                st.session_state.outlier_log = pd.concat(
-                                    [st.session_state.outlier_log, new_log],
-                                    ignore_index=True,
-                                )
-                                reset_modeling_outputs()
-                                st.rerun()
-                    else:
-                        st.success("No endpoint outliers were flagged by the selected z-score/IQR rules.")
 
                 st.markdown("#### Remove outliers from modeling")
                 selectable_ids = pca_result.scores["sample_id"].astype(str).tolist()
@@ -1643,83 +1937,6 @@ with tabs[1]:
                         st.rerun()
             except Exception as exc:
                 st.error(f"PCA screening failed: {exc}")
-
-
-with tabs[2]:
-    st.subheader("Preprocessing")
-    if show_dataset_gate():
-        dataset = active_dataset()
-        summary = dataset_summary(dataset.X, dataset.y)
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            metric_panel("Missing rows", summary["missing_rows"])
-        with c2:
-            metric_panel("Missing columns", summary["missing_columns"])
-        with c3:
-            metric_panel("Endpoint min", f"{dataset.y.min():.4g}")
-        with c4:
-            metric_panel("Endpoint max", f"{dataset.y.max():.4g}")
-
-        left, right = st.columns([0.9, 1.1])
-        with left:
-            endpoint_method = st.selectbox(
-                "Endpoint transformation",
-                ["none", "log10", "negative_log10"],
-                format_func=lambda value: {"none": "No transformation", "log10": "log10(y)", "negative_log10": "-log10(y)"}[value],
-                key="endpoint_method",
-            )
-            histogram_bins = st.slider("Endpoint histogram bins", 5, 80, 24, key="histogram_bins")
-            missing_label = st.selectbox(
-                "Missing descriptor handling",
-                [
-                    "Median imputation",
-                    "Mean imputation",
-                    "Remove descriptor columns with missing values",
-                    "Remove rows with missing descriptors after split",
-                    "Require complete descriptor matrix",
-                ],
-                key="missing_label",
-            )
-            missing_strategy, drop_rows_flag = mapping_missing_strategy(missing_label)
-            remove_constant = st.checkbox("Remove constant descriptors", value=True, key="remove_constant")
-            remove_low_variance = st.checkbox("Remove low-variance descriptors", value=True, key="remove_low_variance")
-            variance_threshold = st.number_input(
-                "Low-variance threshold",
-                min_value=0.0,
-                value=0.0,
-                step=0.0001,
-                format="%.6f",
-                key="variance_threshold",
-            )
-            remove_high_corr = st.checkbox("Remove highly correlated descriptors", value=True, key="remove_high_corr")
-            corr_threshold = st.slider("Absolute correlation threshold", 0.50, 0.999, 0.90, 0.01, key="corr_threshold")
-
-        with right:
-            transformed_y, transform_warnings = endpoint_transform_preview(dataset.y, endpoint_method)
-            display_messages(transform_warnings)
-            hist_cols = st.columns(2)
-            with hist_cols[0]:
-                st.pyplot(endpoint_histogram(dataset.y, bins=histogram_bins, title="Endpoint before transformation"))
-            with hist_cols[1]:
-                st.pyplot(endpoint_histogram(transformed_y, bins=histogram_bins, title="Endpoint after transformation"))
-            stats_frame = pd.DataFrame(
-                {
-                    "Before": dataset.y.describe(),
-                    "After": transformed_y.describe(),
-                }
-            )
-            st.dataframe(stats_frame, use_container_width=True)
-
-        st.session_state.preprocessing_config = PreprocessingConfig(
-            missing_strategy=missing_strategy,
-            remove_constant=remove_constant,
-            remove_low_variance=remove_low_variance,
-            variance_threshold=variance_threshold,
-            remove_high_correlation=remove_high_corr,
-            correlation_threshold=corr_threshold,
-        )
-        st.session_state.drop_rows_after_split = drop_rows_flag
-
 
 with tabs[3]:
     st.subheader("Train/test split")
@@ -2014,6 +2231,22 @@ with tabs[6]:
                 else:
                     metric_panel("GA fitness", "n/a")
 
+            if st.session_state.feature_selection["method"] == "Genetic Algorithm":
+                ga_params = st.session_state.feature_selection.get("params", {})
+                ga_population = int(ga_params.get("population_size", 30))
+                ga_generations = int(ga_params.get("generations", 20))
+                ga_folds = int(ga_params.get("cv_folds", 5))
+                folds_per_subset = max(1, ga_folds if ga_folds >= 2 else 1)
+                approx_ga_subsets = total_candidates * ga_population * (ga_generations + 1)
+                approx_estimator_fits = approx_ga_subsets * folds_per_subset
+                st.caption(
+                    "Approximate GA workload before cache/early stopping: "
+                    f"about {approx_ga_subsets:,} descriptor-subset evaluations and "
+                    f"up to {approx_estimator_fits:,} estimator fits. Live elapsed time and ETA appear after training starts."
+                )
+            else:
+                st.caption("Live elapsed time and ETA appear after training starts.")
+
             if st.button("Run training workflow", type="primary"):
                 try:
                     results, table, warnings = run_training_workflow(
@@ -2082,6 +2315,29 @@ with tabs[7]:
                 value = eval_result.metrics.get(metric, np.nan)
                 metric_panel(metric, f"{value:.4g}" if pd.notna(value) else "n/a")
 
+        st.markdown("#### Descriptor interpretation")
+        importance_frame = payload_descriptor_importance(payload)
+        model_equation, equation_terms = payload_mlr_equation(payload)
+        if model_equation:
+            st.caption("MLR equation using coefficients converted back to the original descriptor scale after the selected scaler.")
+            st.code(model_equation, language="text")
+            if isinstance(equation_terms, pd.DataFrame) and not equation_terms.empty:
+                with st.expander("MLR equation coefficients", expanded=False):
+                    st.dataframe(equation_terms, use_container_width=True)
+        if not importance_frame.empty:
+            importance_fig = payload["figures"].get("Descriptor importance")
+            if importance_fig is None:
+                importance_fig = descriptor_importance_plot(importance_frame, title=f"{selected_label}: descriptor importance")
+            st.pyplot(importance_fig)
+            formatters = {
+                column: "{:.6g}"
+                for column in ["coefficient", "importance", "abs_importance"]
+                if column in importance_frame.columns
+            }
+            st.dataframe(importance_frame.style.format(formatters), use_container_width=True)
+        else:
+            st.info("Native descriptor importance is not available for this model. For SVR, use a linear kernel or compare with linear/tree models for descriptor-level interpretation.")
+
         st.markdown("#### Observed vs predicted")
         st.plotly_chart(
             interactive_observed_vs_predicted(
@@ -2144,7 +2400,7 @@ with tabs[7]:
         plot_names = [
             name
             for name in payload["figures"].keys()
-            if not name.startswith("Applicability Domain") and name != "Observed vs predicted"
+            if not name.startswith("Applicability Domain") and name not in {"Observed vs predicted", "Descriptor importance"}
         ]
         if plot_names:
             selected_plot = st.selectbox("Plot", plot_names)
@@ -2207,6 +2463,22 @@ with tabs[8]:
                 file_name=f"{export_stem}_removed_descriptors.csv",
                 mime="text/csv",
             )
+            importance_export = payload_descriptor_importance(payload)
+            if not importance_export.empty:
+                st.download_button(
+                    "Download descriptor importance CSV",
+                    data=dataframe_to_csv_bytes(importance_export),
+                    file_name=f"{export_stem}_descriptor_importance.csv",
+                    mime="text/csv",
+                )
+            equation_export, _ = payload_mlr_equation(payload)
+            if equation_export:
+                st.download_button(
+                    "Download MLR equation TXT",
+                    data=equation_export.encode("utf-8"),
+                    file_name=f"{export_stem}_mlr_equation.txt",
+                    mime="text/plain",
+                )
             selected_model_bundle = build_selected_model_bundle(selected_label, payload, st.session_state.results_df)
             st.download_button(
                 "Download selected model bundle",
